@@ -162,6 +162,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    has_masked_experts: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -243,10 +244,11 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    skip_masked_experts = expert_map is not None or has_masked_experts
     if (
         M == 1
         and topk <= 32
-        and expert_map is None
+        and not skip_masked_experts
         # The JIT kernel is int32-only; torch-native topk emits int64 -- let
         # that (test-only) shape take the generic path instead of casting.
         and topk_ids.dtype == torch.int32
@@ -320,7 +322,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
-        is_ep=expert_map is not None,
+        is_ep=skip_masked_experts,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -362,7 +364,10 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
+    if skip_masked_experts:
+        # GEMM leaves -1 routes untouched. Clear their shared output cache so
+        # the final top-k reduction contributes exactly zero for CPU/non-local
+        # experts instead of values left by the gate/up GEMM.
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
@@ -383,7 +388,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=expert_map is not None,
+        is_ep=skip_masked_experts,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,

@@ -205,6 +205,14 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
+        # KT hybrid execution compacts the GPU weights to num_local_experts
+        # and marks CPU routes with -1, just like EP dispatch. Marlin must use
+        # its EP-capable specialization even though no EP expert_map exists.
+        has_masked_experts=(
+            runner_config.num_experts is not None
+            and runner_config.num_local_experts is not None
+            and runner_config.num_local_experts < runner_config.num_experts
+        ),
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

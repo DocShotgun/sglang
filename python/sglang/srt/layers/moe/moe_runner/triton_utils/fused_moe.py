@@ -1000,7 +1000,7 @@ def fused_experts_impl(
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert hidden_states.shape[1] == w1.shape[2] - padded_size, (
-            "Hidden size mismatch"
+            "Hidden size mismatch" + ', '+ str(hidden_states.shape[1]) + ', '+ str(w1.shape[2]) +', '+ str(padded_size)
         )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"

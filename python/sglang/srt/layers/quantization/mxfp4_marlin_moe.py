@@ -142,8 +142,10 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        platform = get_platform()
+        is_sm8x = platform.is_cuda and 80 <= platform.device_sm < 90
+        if not (is_sm8x or platform.is_sm90 or platform.is_sm120):
+            raise RuntimeError("MXFP4 Marlin requires SM8x, SM90 or SM120.")
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(

@@ -7,12 +7,16 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.arg_groups.overrides import model_config_of
+#from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
+def stream_prefill_for(*args, **kwargs):
+    return None
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
@@ -108,10 +112,50 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
         num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
 
     Returns:
-        Modified topk_ids tensor with CPU expert IDs masked as -1
+        A tensor with CPU expert IDs masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    # Do not mutate the router output. The CPU path copies it asynchronously,
+    # and other consumers may still need the original global expert IDs.
+    return torch.where(
+        topk_ids < num_gpu_experts,
+        topk_ids,
+        torch.full_like(topk_ids, -1),
+    )
+
+
+_routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
+_routing_state = {}
+# layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
+# (rank 0); the streamed-prefill zero-copy path hands every layer's expert
+# arenas to the other ranks in one go.
+KT_LAYERS = {}
+
+
+def _routing_count(device, layer_idx, topk_ids, rank):
+    import threading
+    import time
+
+    st = _routing_state.get(device.index)
+    if st is None:
+        counts = torch.zeros((64, 512), dtype=torch.int32, device=device)
+        ones = torch.ones((1,), dtype=torch.int32, device=device)
+        st = _routing_state[device.index] = {"counts": counts, "ones": ones}
+
+        def dump():
+            while True:
+                time.sleep(30)
+                try:
+                    c = st["counts"].cpu()
+                    torch.save(
+                        {"rank": rank, "logical_count": c},
+                        f"{_routing_dump_prefix}-rank{rank}.pt",
+                    )
+                except Exception as e:  # never take the scheduler down for a dump
+                    print(f"[kt-routing] dump failed: {e}", flush=True)
+
+        threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
+    ids = topk_ids.reshape(-1).to(torch.int64)
+    st["counts"][layer_idx].index_add_(0, ids, st["ones"].expand(ids.numel()))
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -215,20 +259,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
-        if self.tp_rank == 0:
+        # An all-GPU placement has no CPU weights or CPU work to initialize.
+        if self.tp_rank == 0 and self.num_gpu_experts < num_experts:
+            # kt-kernel 0.7.0 inference API takes an explicit boolean mask of
+            # GPU-resident experts instead of num_gpu_experts (SFT-only).
+            # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
+            gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+            gpu_mask[: self.num_gpu_experts] = True
+            KT_LAYERS[self.kt_config.layer_idx] = self
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=gpu_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                # KT_NUMA_NODES="1" pins a single pool to node 1, the node
+                # that does not host the TP0 scheduler, for the prefill-decay
+                # isolation; unset keeps kt-kernel's sequential default.
+                numa_nodes=(
+                    [int(x) for x in os.environ["KT_NUMA_NODES"].split(",")]
+                    if os.environ.get("KT_NUMA_NODES")
+                    else None
+                ),
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -238,7 +297,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        if (
+            hasattr(self.gpu_method, "process_weights_after_loading")
+            and self.num_gpu_experts > 0
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
@@ -297,6 +359,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
+        # KT_ROUTING_DUMP=<prefix>: accumulate a [layers, experts] histogram of
+        # the routed expert ids on the GPU (a captured index_add_, so it keeps
+        # counting under CUDA graph replay) and save it as
+        # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
+        # never sees the V4 router's ids (09-13); this does.
+        if _routing_dump_prefix:
+            _routing_count(x.device, self.kt_config.layer_idx, topk_ids, self.tp_rank)
+
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
@@ -344,9 +414,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        # --init-expert-location moves experts between the GPU slots (physical
+        # 0..num_gpu_experts-1) and the CPU, and both weight loaders honour it,
+        # but the V4 router hands this wrapper *logical* ids (the topk remap in
+        # topk.py only runs with --enable-eplb). Remap here, once per layer,
+        # so a hot-expert placement actually routes to the GPU slots.
+        log2phy = self._logical_to_physical(x.device)
+        if log2phy is not None:
+            ids = topk_output.topk_ids
+            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(ids.dtype)
+            topk_output = topk_output._replace(topk_ids=remapped)
+            dispatch_output = dispatch_output._replace(topk_output=topk_output)
+
+        # KT_GPU_STREAM_PREFILL=<tokens>: above that many tokens the CPU
+        # experts are streamed to the GPU in groups instead of computed here
+        # (kt_stream_prefill.py). Keep a separate copy for the streaming path.
+        streamer = stream_prefill_for(self, layer, x.shape[0])
+        if streamer is not None:
+            physical_ids = topk_output.topk_ids.clone()
 
         # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
+        if streamer is None and self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
@@ -354,7 +442,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_ids = topk_output.topk_ids
         masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
 
-        # Create modified dispatch output for GPU computation
+        # Marlin receives the -1 routes together with
+        # num_local_experts < num_experts and skips them in its EP-capable
+        # kernel specialization. Keeping the sentinel avoids doing dummy GPU
+        # GEMMs for CPU-bound routes.
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
         masked_dispatch_output = dispatch_output._replace(
             topk_output=masked_topk_output
@@ -362,15 +453,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 3: Execute GPU expert computation (any quantization method)
         # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+
+        if self.num_gpu_experts > 0:
+            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            output = gpu_combine_input.hidden_states
+        else:
+            gpu_combine_input = None
+            output = torch.zeros_like(x)
 
         # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
-        if self.tp_rank == 0:
+        if streamer is not None:
+            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
+        elif self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)
+
+    def _logical_to_physical(self, device):
+        cached = self.__dict__.get("_log2phy_cache", "unset")
+        if cached != "unset":
+            return cached
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        meta = get_global_expert_location_metadata()
+        table = None
+        if meta is not None:
+            m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(device)
+            if not torch.equal(m.cpu(), torch.arange(m.numel(), dtype=m.dtype)):
+                table = m.to(torch.int64)
+        self.__dict__["_log2phy_cache"] = table
+        return table
 
     def __getattr__(self, name: str):
         """Delegate attribute access to the wrapped GPU method.

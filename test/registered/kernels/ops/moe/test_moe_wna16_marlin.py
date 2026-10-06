@@ -10,6 +10,7 @@ from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_moe_mxfp4_layer_for_marlin,
     prepare_moe_nvfp4_layer_for_marlin,
 )
 from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
@@ -682,6 +683,80 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.cuda is None
+    or torch.cuda.get_device_capability()[0] < 8,
+    reason="requires SM80 or newer",
+)
+@pytest.mark.parametrize("tokens", [1, 17])
+@pytest.mark.parametrize("masked", [False, True])
+def test_fused_marlin_moe_mxfp4_matches_dequant_reference(tokens, masked):
+    torch.manual_seed(42)
+    experts, hidden, intermediate, topk = 4, 256, 128, 2
+    dtype = torch.bfloat16
+    levels = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+    )
+
+    def make_weight(rows, cols):
+        codes = torch.randint(16, (experts, rows, cols), device="cuda")
+        scales = torch.randint(
+            120, 124, (experts, rows, cols // 32), device="cuda", dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu)
+        packed = (codes[..., ::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
+        reference = (
+            levels[codes] * scales.float().repeat_interleave(32, dim=-1)
+        ).to(dtype)
+        return packed, scales, reference
+
+    w13, s13, ref13 = make_weight(2 * intermediate, hidden)
+    w2, s2, ref2 = make_weight(hidden, intermediate)
+    layer = torch.nn.Module()
+    layer.orig_dtype = dtype
+    for name, value in (
+        ("w13_weight", w13),
+        ("w2_weight", w2),
+        ("w13_weight_scale_inv", s13),
+        ("w2_weight_scale_inv", s2),
+    ):
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+    prepare_moe_mxfp4_layer_for_marlin(layer)
+
+    x = torch.randn(tokens, hidden, device="cuda", dtype=dtype) / 4
+    logits = torch.randn(tokens, experts, device="cuda")
+    weights, ids = logits.softmax(-1).topk(topk)
+    weights /= weights.sum(-1, keepdim=True)
+    if masked:
+        ids[:, 1] = -1
+    output = fused_marlin_moe(
+        hidden_states=x,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=logits,
+        topk_weights=weights,
+        topk_ids=ids,
+        workspace=layer.workspace,
+        num_bits=4,
+        has_masked_experts=masked,
+    )
+    expected = torch.zeros_like(x, dtype=torch.float32)
+    for token in range(tokens):
+        for route in range(topk):
+            expert = ids[token, route]
+            if expert < 0:
+                continue
+            gate, up = (x[token] @ ref13[expert].T).chunk(2)
+            activation = torch.nn.functional.silu(gate) * up
+            expected[token] += (activation @ ref2[expert].T).float() * weights[
+                token, route
+            ]
+    torch.testing.assert_close(output.float(), expected, rtol=0.04, atol=0.003)
 
 
 if __name__ == "__main__":

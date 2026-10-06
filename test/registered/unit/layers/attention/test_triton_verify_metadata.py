@@ -25,6 +25,7 @@ class _BonusTokenVerifyInput(SpecInput):
 
 class _KVIndexTranslator:
     is_translating = False
+    reads_are_translated = False
 
     def fill_packed_read_stream(
         self,
@@ -36,6 +37,14 @@ class _KVIndexTranslator:
         out,
     ):
         out.zero_()
+
+
+class _SlidingKVIndexTranslator(_KVIndexTranslator):
+    def fill_packed_read_stream(self, **kwargs):
+        if kwargs.get("kv_start_idx") is not None:
+            self.kv_start_idx = kwargs["kv_start_idx"].clone()
+        kwargs["out"].zero_()
+        return False
 
 
 class _RecordingTritonBackend(TritonAttnBackend):
@@ -150,6 +159,40 @@ def test_graph_capture_and_padded_replay_use_bonus_token_width(
     )
 
     _assert_verify_width(backend, batch_size)
+
+
+def test_graph_draft_extend_populates_sliding_window_metadata():
+    batch_size = 2
+    backend = _make_backend(batch_size)
+    backend.sliding_window_size = 4
+    backend.kv_index_translator = _SlidingKVIndexTranslator()
+    backend.token_to_kv_pool = SimpleNamespace()
+    backend.cuda_graph_window_kv_indices = torch.zeros(32, dtype=torch.int64)
+    backend.cuda_graph_window_kv_offsets = torch.zeros(
+        batch_size, dtype=torch.int32
+    )
+
+    spec_info = SimpleNamespace(
+        extend_seq_lens_tensor=torch.tensor([3, 3], dtype=torch.int32)
+    )
+    seq_lens = torch.tensor([8, 10], dtype=torch.int64)
+    backend._apply_cuda_graph_metadata(
+        bs=batch_size,
+        req_pool_indices=torch.arange(batch_size, dtype=torch.int64),
+        seq_lens=seq_lens,
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        spec_info=spec_info,
+    )
+    metadata = backend._build_cuda_graph_forward_metadata(
+        batch_size, ForwardMode.DRAFT_EXTEND_V2, spec_info
+    )
+
+    assert metadata.window_kv_indices is backend.cuda_graph_window_kv_indices
+    assert torch.equal(metadata.window_kv_indptr, torch.tensor([0, 4, 8]))
+    assert torch.equal(metadata.window_kv_offsets[:batch_size], torch.tensor([1, 3]))
+    assert torch.equal(
+        backend.kv_index_translator.kv_start_idx, torch.tensor([1, 3])
+    )
 
 
 @pytest.mark.parametrize("with_spec_info", (False, True))

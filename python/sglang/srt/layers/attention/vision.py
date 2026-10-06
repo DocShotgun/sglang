@@ -404,16 +404,61 @@ class VisionSdpaAttention(nn.Module):
         else:
             attention_mask = attention_mask.to(device=q.device)
 
+        window_left, window_right = kwargs.get("window_size", (-1, -1))
+        if window_left >= 0 or window_right >= 0:
+            positions = torch.arange(s, device=q.device)
+            distance = positions[None, :] - positions[:, None]
+            window_mask = torch.ones_like(distance, dtype=torch.bool)
+            if window_left >= 0:
+                window_mask &= distance >= -window_left
+            if window_right >= 0:
+                window_mask &= distance <= window_right
+            if attention_mask is None:
+                attention_mask = window_mask
+            elif attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask & window_mask
+            else:
+                attention_mask = attention_mask.masked_fill(~window_mask, -torch.inf)
+
         q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
         k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
         v = v.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
+
+        if self.num_heads != self.num_kv_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+
+        s_aux = kwargs.get("s_aux")
+        if s_aux is not None:
+            # A zero-valued extra KV token with a per-head logit implements
+            # the sink's contribution to the softmax denominator in SDPA.
+            if attention_mask is None:
+                attention_mask = q.new_zeros(s, s)
+            elif attention_mask.dtype == torch.bool:
+                attention_mask = q.new_zeros(attention_mask.shape).masked_fill(
+                    ~attention_mask, -torch.inf
+                )
+            # CUDA SDPA backends require the bias to match the query dtype.
+            attention_mask = attention_mask.to(q.dtype)
+            sink_mask = s_aux.to(q).view(1, self.num_heads, 1, 1)
+            attention_mask = torch.cat(
+                (
+                    attention_mask.expand(bsz, self.num_heads, s, s),
+                    sink_mask.expand(bsz, self.num_heads, s, 1),
+                ),
+                dim=-1,
+            )
+            k = torch.cat((k, torch.zeros_like(k[:, :, :1])), dim=2)
+            v = torch.cat((v, torch.zeros_like(v[:, :, :1])), dim=2)
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
             attn_weights = torch.matmul(q, k) * self.scale
             del k
             # masking
-            attention_mask = (~attention_mask) * torch.finfo(q.dtype).min
+            if attention_mask.dtype == torch.bool:
+                attention_mask = (~attention_mask) * torch.finfo(q.dtype).min
             attn_weights = attn_weights + attention_mask
             del attention_mask
             # full-precision

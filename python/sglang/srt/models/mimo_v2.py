@@ -1188,6 +1188,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
 
     # Prefixes for weight routing in encoder_only/language_only modes
     _LANGUAGE_WEIGHT_PREFIXES = ("model.", "lm_head.")
