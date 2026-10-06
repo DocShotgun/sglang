@@ -2861,6 +2861,7 @@ class DeepseekSparseAttnBackend(
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
+            sparse_mla_top_k=self.dsa_index_topk,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )

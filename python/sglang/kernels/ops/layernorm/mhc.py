@@ -592,17 +592,58 @@ def mhc_pre_gemm_sqrsum_tilelang(
 
 
 @functools.cache
+def _deepgemm_prenorm_available() -> bool:
+    """True when the tf32 hc-prenorm DeepGEMM kernels can actually run.
+
+    JIT DeepGEMM is disabled in the SM120 launch profile
+    (SGLANG_ENABLE_JIT_DEEPGEMM=0), and DeepGEMM builds older than #324 have
+    no SM120 kernels at all, so callers must fall back to the TileLang split-K
+    GEMM+sqrsum kernels whenever this is False. The configurer import is
+    deferred because it queries device SM at import time while mhc.py is
+    imported during model-registry discovery.
+    """
+    if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
+        return False
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    return ENABLE_JIT_DEEPGEMM
+
+
+_mhc_pre_gemm_dispatch_lock = threading.Lock()
+_mhc_pre_gemm_dispatch_resolved = None
+
+
 def _mhc_pre_gemm_sqrsum_dispatch():
     """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
     marker fails on tirx.Bind), so re-wrap it there with warp specialization
-    disabled. Other archs keep the original compiled form."""
-    from sglang.srt.utils import is_sm120_supported
+    disabled. Other archs keep the original compiled form.
 
-    if not is_sm120_supported():
-        return mhc_pre_gemm_sqrsum_tilelang
-    _tl = _load_tilelang()
-    cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
-    return _tl.jit(pass_configs=cfg)(mhc_pre_gemm_sqrsum_tilelang.__wrapped__)
+    Resolution is lock-singleton: this is called per forward, and rebuilding
+    the jit wrapper walks TileLang's kernel cache / JIT compile machinery,
+    which is not thread-safe under concurrent forward threads (segfault spam
+    across all threads). functools.cache is insufficient -- concurrent first
+    calls all miss and resolve in parallel -- so serialize resolution behind
+    a lock and memoize the wrapper globally.
+    """
+    global _mhc_pre_gemm_dispatch_resolved
+    wrapper = _mhc_pre_gemm_dispatch_resolved
+    if wrapper is not None:
+        return wrapper
+    with _mhc_pre_gemm_dispatch_lock:
+        wrapper = _mhc_pre_gemm_dispatch_resolved
+        if wrapper is None:
+            from sglang.srt.utils import is_sm120_supported
+
+            if not is_sm120_supported():
+                wrapper = mhc_pre_gemm_sqrsum_tilelang
+            else:
+                _tl = _load_tilelang()
+                cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+                wrapper = _tl.jit(pass_configs=cfg)(
+                    mhc_pre_gemm_sqrsum_tilelang.__wrapped__
+                )
+            _mhc_pre_gemm_dispatch_resolved = wrapper
+    return wrapper
 
 
 @functools.cache
@@ -1041,7 +1082,7 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and _deepgemm_prenorm_available():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1653,7 +1694,7 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and _deepgemm_prenorm_available():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(

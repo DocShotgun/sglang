@@ -16,6 +16,8 @@ import math
 from functools import lru_cache
 from typing import FrozenSet, Optional, Tuple
 
+_kv_compact_scratch = None  # module-level grow-only repack scratch
+
 import torch
 import triton
 import triton.language as tl
@@ -29,6 +31,10 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    # GLM-5.3-Flash (glm5_next): same DSA sparse-MLA page layout
+    # (kv_lora_rank 512 = nope 448 + rope 64) and FP8 KV cache on SM120.
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):
@@ -722,29 +728,132 @@ def flashinfer_sparse_mla_forward(
     qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    sparse_mla_top_k: int,
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
 ) -> torch.Tensor:
     """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
-    topk = indices.shape[1]
-    result = trtllm_batch_decode_with_kv_cache_mla(
-        query=q.unsqueeze(1),
-        kv_cache=kv_cache.view(torch.uint8)
-        .view(-1, page_size, kv_cache_dim)
-        .unsqueeze(1),
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        block_tables=indices.unsqueeze(1),
-        seq_lens=seq_lens,
-        max_seq_len=topk,
-        sparse_mla_top_k=topk,
-        bmm1_scale=float(sm_scale),
-        bmm2_scale=1.0,
-        kv_scale_format="arbitrary_fp32",
-        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-    )
-    return result.squeeze(1)
+    topk_capacity = sparse_mla_top_k
+    kernel_qk_rope_head_dim = qk_rope_head_dim
+    empty_rows = None
+    sparse_mla_top_k_lens = None
+    if qk_rope_head_dim == 0:
+        from sglang.kernels.ops.attention.dsa.transform_index import (
+            prepare_trtllm_nope_sparse_metadata,
+        )
+
+        sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(indices)
+        # The SM120 kernel inventory has only the DeepSeek 576-wide query /
+        # 64-wide RoPE geometry.  Appending zeros presents that geometry while
+        # preserving GLM-5.3's native NoPE math.
+        q = torch.nn.functional.pad(q, (0, 64))
+        kernel_qk_rope_head_dim = 64
+
+        # index_kpool may reserve overflow columns for an in-progress tail.
+        # The compiled kernel accepts exactly index_topk columns.  KPool now
+        # compacts the tail inside this capacity; keep this guard for old or
+        # graph-captured buffers.
+        if indices.shape[1] > topk_capacity:
+            indices = indices[:, :topk_capacity].contiguous()
+            sparse_mla_top_k_lens = sparse_mla_top_k_lens.clamp(max=topk_capacity)
+
+        empty_rows = sparse_mla_top_k_lens == 0
+        indices[:, 0] = indices[:, 0].masked_fill(empty_rows, 0)
+        seq_lens = sparse_mla_top_k_lens.clamp(min=1)
+
+    topk_capacity = min(topk_capacity, indices.shape[1])
+
+    # GLM-5.3-Flash native-NoPE packed rows are 512 fp8 latent + 16 B scales
+    # (528 B/token).  The v32/GLM kernel consumes 656 B/token =
+    # nope_fp8(512) + per-group scales(16) + rope_bf16(128).  The rope slot is
+    # unread: q's appended rope block is zeros, so rope dot products vanish and
+    # GLM-5.3's native NoPE math is preserved exactly.  Compact the referenced
+    # rows into a page-aligned scratch cache and append the zero rope footer.
+    kv_u8 = kv_cache.view(torch.uint8)
+    kv_rows = kv_u8.view(-1, kv_cache_dim)
+
+    # The repack scratch scales as tokens * sparse_topk * 656 B (compact kv)
+    # plus tokens * sparse_topk * 528 B (gather temp): an 8k-token extend batch
+    # at topk=2048 needs ~11 GiB compact + ~8 GiB gather and OOM'd outright on
+    # SM120 ("Tried to allocate 8.20 GiB" at kv_rows[flat_idx]). Chunk the call
+    # over query tokens so peak scratch stays <= ~4 GiB for any batch size;
+    # decode (1 token) stays a single chunk.
+    rows_budget = max(1, (4 << 30) // 656)
+    tok_chunk = max(1, rows_budget // max(1, topk_capacity))
+    gather_chunk = 1 << 21  # <= ~1 GiB gather temp at 528 B/row
+
+    outs = []
+    for t0 in range(0, indices.shape[0], tok_chunk):
+        t1 = min(t0 + tok_chunk, indices.shape[0])
+        sub_idx = indices[t0:t1]
+        sub_seq_lens = seq_lens[t0:t1]
+        if kv_cache_dim == 656:
+            kv_arg = kv_u8.view(-1, page_size, kv_cache_dim).unsqueeze(1)
+            block_tables = sub_idx.unsqueeze(1)
+        else:
+            flat_idx = sub_idx.reshape(-1).long().clamp_min(0)
+            n_tok = flat_idx.numel()
+            n_pad = (n_tok + page_size - 1) // page_size * page_size
+            # Grow-only scratch reused across layer-calls: allocating torch.zeros
+            # per call cost 45 x <=4 GiB memset per prefill chunk. Only
+            # [:, :kv_cache_dim] is ever overwritten by the gather, and rows
+            # beyond n_tok are never referenced by block_tables, so stale bytes
+            # are unread -- and the zero rope-footer invariant survives reuse
+            # forever (the gather never writes it). Under CUDA-graph capture
+            # fall back to a fresh allocation so captured addresses stay valid
+            # at replay.
+            global _kv_compact_scratch
+            capturing = torch.cuda.is_current_stream_capturing()
+            scratch = None if capturing else _kv_compact_scratch
+            if (
+                scratch is not None
+                and scratch.shape[0] >= n_pad
+                and scratch.device == kv_rows.device
+            ):
+                kv_compact = scratch[:n_pad]
+            else:
+                kv_compact = torch.zeros(
+                    (n_pad, 656), dtype=torch.uint8, device=kv_rows.device
+                )
+                if not capturing:
+                    _kv_compact_scratch = kv_compact
+            for lo in range(0, n_tok, gather_chunk):
+                hi = min(lo + gather_chunk, n_tok)
+                kv_compact[lo:hi, :kv_cache_dim] = kv_rows[flat_idx[lo:hi]]
+            kv_arg = kv_compact.view(-1, page_size, 656).unsqueeze(1)
+            block_tables = (
+                torch.arange(n_tok, dtype=sub_idx.dtype, device=sub_idx.device)
+                .view(sub_idx.shape)
+                .unsqueeze(1)
+            )
+
+        result = trtllm_batch_decode_with_kv_cache_mla(
+            query=q[t0:t1].unsqueeze(1),
+            kv_cache=kv_arg,
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=kernel_qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=sub_seq_lens,
+            max_seq_len=topk_capacity,
+            sparse_mla_top_k=topk_capacity,
+            # Once the NoPE tensors are padded to the DeepSeek RoPE64 geometry,
+            # FlashInfer selects the compiled RoPE64 kernel.  Its active lengths
+            # are carried by seq_lens; the native-NoPE-only metadata argument must
+            # stay unset or the public wrapper rejects the call before dispatch.
+            sparse_mla_top_k_lens=None,
+            bmm1_scale=float(sm_scale),
+            bmm2_scale=1.0,
+            kv_scale_format="arbitrary_fp32",
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=False,
+        )
+        outs.append(result.squeeze(1))
+        del kv_arg, result
+    result = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+    if empty_rows is not None:
+        result.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+    return result

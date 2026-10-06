@@ -54,6 +54,9 @@ class KTConfig:
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
+        swiglu_limit: SwiGLU clamp applied before SiLU (0.0 disables).
+            Required for GLM-5-Next checkpoints whose GPU path clamps
+            gate/up to +-10 (config.swiglu_limit).
     """
 
     layer_idx: int
@@ -65,6 +68,7 @@ class KTConfig:
     max_deferred_experts_per_token: int
     method: str
     num_layers: Optional[int] = None
+    swiglu_limit: float = 0.0
 
 
 def create_kt_config_from_server_args(
@@ -85,6 +89,12 @@ def create_kt_config_from_server_args(
     num_layers = getattr(
         model_config_of(server_args).hf_config, "num_hidden_layers", None
     )
+    # GLM-5-Next clamps gate/up inside SwiGLU on the GPU path (see
+    # models/glm5_next.py swiglu_clamped); kt must clamp identically or CPU
+    # and GPU experts diverge.
+    swiglu_limit = float(
+        getattr(model_config_of(server_args).hf_config, "swiglu_limit", 0.0) or 0.0
+    )
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -96,6 +106,7 @@ def create_kt_config_from_server_args(
         method=get_exec().moe.kt_method,
         max_deferred_experts_per_token=get_exec().moe.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -248,14 +259,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 1. Create weights for GPU experts using the wrapped method
         # GPU experts: 0 to num_gpu_experts-1
-        self.gpu_method.create_weights(
-            layer=layer,
-            num_experts=self.num_gpu_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            **extra_weight_attrs,
-        )
+        # ModelOpt (NVFP4) methods size their tensors from
+        # layer.num_local_experts instead of the num_experts argument, which
+        # would allocate every routed expert on the GPU (~4.5 GiB/layer for
+        # GLM-5.3-Flash) and OOM during weight creation. Mask the attribute
+        # for the duration of the call so every method allocates the GPU
+        # slice only; _weight_loader_physical additionally skips checkpoint
+        # experts >= num_gpu_experts at load time.
+        saved_num_local_experts = layer.num_local_experts
+        layer.num_local_experts = self.num_gpu_experts
+        try:
+            self.gpu_method.create_weights(
+                layer=layer,
+                num_experts=self.num_gpu_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                params_dtype=params_dtype,
+                **extra_weight_attrs,
+            )
+        finally:
+            layer.num_local_experts = saved_num_local_experts
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
@@ -280,6 +303,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                swiglu_limit=self.kt_config.swiglu_limit,
                 # KT_NUMA_NODES="1" pins a single pool to node 1, the node
                 # that does not host the TP0 scheduler, for the prefill-decay
                 # isolation; unset keeps kt-kernel's sequential default.
@@ -437,26 +461,55 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if streamer is None and self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+        # Step 2/3: GPU expert computation on VALID GPU routes only.
+        #
+        # marlin's EP-capable specialization (-1 routes / expert_ids=-1 blocks)
+        # garbles NVFP4 on SM120 ("17*23" -> "!ththth..."); its plain all-local
+        # path is correct (the configuration Lsglang proves). Both strategies
+        # below keep marlin on the plain path and contribute exactly zero for
+        # CPU routes through the top-k reduction:
+        #   * compact rows (prefill-sized batches): gather only the GPU-route
+        #     rows, run marlin with topk=1 per row, scatter-add the weighted
+        #     rows back. GPU MoE flops ~= gpu-route share of traffic instead of
+        #     all M*topk rows.
+        #   * dummy rows (small batches / CUDA-graph decode): remap CPU routes
+        #     to expert id 0 with routing weight 0; marlin computes weighted-zero
+        #     rows. Static shapes only -- decode graph capture (bs=1) must never
+        #     take data-dependent branches, hence the token gate + capture check.
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
-
-        # Marlin receives the -1 routes together with
-        # num_local_experts < num_experts and skips them in its EP-capable
-        # kernel specialization. Keeping the sentinel avoids doing dummy GPU
-        # GEMMs for CPU-bound routes.
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
-
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
 
         if self.num_gpu_experts > 0:
-            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
-            output = gpu_combine_input.hidden_states
+            compact = (
+                x.shape[0] >= 16  # decode-graph capture runs at bs=1
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            if compact:
+                gpu_rows, tok_idx = self._gpu_rows_compact(
+                    layer, dispatch_output, topk_output
+                )
+                output = torch.zeros_like(x)
+                if gpu_rows is not None:
+                    output.index_add_(0, tok_idx, gpu_rows)
+            else:
+                dummy_topk_ids = torch.where(
+                    topk_ids < self.num_gpu_experts,
+                    topk_ids,
+                    torch.zeros_like(topk_ids),
+                )
+                dummy_topk_weights = torch.where(
+                    topk_ids < self.num_gpu_experts,
+                    topk_output.topk_weights,
+                    torch.zeros_like(topk_output.topk_weights),
+                )
+
+                masked_topk_output = topk_output._replace(
+                    topk_ids=dummy_topk_ids, topk_weights=dummy_topk_weights
+                )
+                masked_dispatch_output = dispatch_output._replace(
+                    topk_output=masked_topk_output
+                )
+                gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+                output = gpu_combine_input.hidden_states
         else:
             gpu_combine_input = None
             output = torch.zeros_like(x)
@@ -469,6 +522,48 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)
+
+    def _gpu_rows_compact(self, layer, dispatch_output, topk_output):
+        """Run GPU experts on only the GPU-route rows and return weighted rows.
+
+        Gathers rows routed to GPU experts (id < num_gpu_experts) into a
+        contiguous [R, hidden] batch with topk=1 per row, runs the GPU quant
+        method on it, and returns (weighted_rows, tok_idx) so apply() can
+        scatter-add them back per token. CPU-route rows never reach marlin at
+        all -- no dummy GEMMs -- while marlin keeps its plain all-local
+        semantics (row weights come in via topk_weights as usual). Returns
+        (None, None) when no route hits a GPU expert.
+        """
+        x = dispatch_output.hidden_states
+        topk_ids = topk_output.topk_ids
+        sel = topk_ids < self.num_gpu_experts
+        tok_idx = (
+            torch.arange(x.shape[0], device=x.device, dtype=torch.long)
+            .unsqueeze(1)
+            .expand_as(topk_ids)
+        )
+        if not bool(sel.any()):
+            return None, None
+        tok_idx = tok_idx[sel].contiguous()
+
+        ids_r = topk_ids[sel].view(-1, 1)
+        w_r = topk_output.topk_weights[sel].view(-1, 1)
+        rl = getattr(topk_output, "router_logits", None)
+        if rl is not None:
+            rows_topk = topk_output._replace(
+                topk_ids=ids_r, topk_weights=w_r, router_logits=rl[tok_idx]
+            )
+        else:
+            rows_topk = topk_output._replace(topk_ids=ids_r, topk_weights=w_r)
+
+        x_rows = x.unsqueeze(1).expand(-1, topk_ids.shape[1], -1)[sel].contiguous()
+        rows_dispatch = dispatch_output._replace(
+            hidden_states=x_rows, topk_output=rows_topk
+        )
+        combine_in = self.gpu_method.apply(layer, rows_dispatch)
+        # Marlin weights each output row by its routing weight (gemm2
+        # mul_topk_weights), so rows are ready for scatter-add accumulation.
+        return combine_in.hidden_states, tok_idx
 
     def _logical_to_physical(self, device):
         cached = self.__dict__.get("_log2phy_cache", "unset")

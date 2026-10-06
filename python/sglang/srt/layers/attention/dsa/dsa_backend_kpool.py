@@ -38,10 +38,14 @@ class DeepseekSparseAttnBackendKPoolMixin:
         dsa_impl: _DSA_IMPL_T,
         phase: str,
     ) -> None:
+        # flashinfer_sparse_mla consumes appended tails in place: its SM120
+        # sparse kernel takes a packed-valid/-1-padding index matrix and masks
+        # rows with dsa_cache_seqlens_int32, which compute_dsa_seqlens already
+        # counts tail tokens into for index_kpool > 1.
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_sparse_mla")
         ):
             return
         raise NotImplementedError(
