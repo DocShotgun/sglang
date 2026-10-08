@@ -544,6 +544,154 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+_MPOL_INTERLEAVE = 3
+# mbind(2) syscall numbers, verified against kernel UAPI (x86_64/i386 from
+# asm/unistd_*.h, asm-generic/unistd.h covers arm64/riscv64/loong64, s390x and
+# powerpc from arch syscall.tbl). libc exports no mbind wrapper -- the NUMA
+# ABI lives in libnuma -- so we always go through the raw syscall().
+_SYS_MBIND_BY_MACHINE = {
+    "x86_64": 237,
+    "amd64": 237,
+    "i386": 274,
+    "i686": 274,
+    "aarch64": 235,
+    "arm64": 235,
+    "riscv64": 235,
+    "loong64": 235,
+    "ppc64": 259,
+    "ppc64le": 259,
+    "s390x": 268,
+}
+
+
+def _mbind_interleave(ptr: int, nbytes: int, nodemask, maxnode: int) -> int:
+    """mbind(2): libc's wrapper when exported, otherwise a raw syscall()."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = getattr(libc, "mbind", None)
+    if fn is not None:
+        fn.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_ulong,
+            ctypes.c_uint,
+        )
+        fn.restype = ctypes.c_int
+        return fn(
+            ctypes.c_void_p(ptr),
+            ctypes.c_ulong(nbytes),
+            _MPOL_INTERLEAVE,
+            nodemask,
+            ctypes.c_ulong(maxnode),
+            ctypes.c_uint(0),
+        )
+    syscall_nr = _SYS_MBIND_BY_MACHINE.get(os.uname().machine.lower())
+    if syscall_nr is None:
+        ctypes.set_errno(errno.ENOSYS)
+        return -1
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    syscall.argtypes = (ctypes.c_long,)
+    # Every argument wrapped explicitly: undeclared variadic args collapse
+    # Python ints to 32-bit C ints, silently truncating GiB-scale lengths.
+    return syscall(
+        ctypes.c_long(syscall_nr),
+        ctypes.c_void_p(ptr),
+        ctypes.c_ulong(nbytes),
+        ctypes.c_int(_MPOL_INTERLEAVE),
+        nodemask,
+        ctypes.c_ulong(maxnode),
+        ctypes.c_uint(0),
+    )
+
+
+def _parse_node_ranges(text: str) -> list[int]:
+    """Expand sysfs node-range notation ("0-3", "0,2-5") to ids; [] on garbage."""
+    nodes = []
+    try:
+        for chunk in text.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            lo, sep, hi = chunk.partition("-")
+            start = int(lo)
+            nodes.extend(range(start, (int(hi) + 1) if sep else (start + 1)))
+    except ValueError:
+        return []
+    return nodes
+
+
+def _online_numa_nodes(root: str = "/sys/devices/system/node") -> list[int]:
+    """Online NUMA node ids.
+
+    sysfs's "online" ranges are authoritative: offline possible-nodes would
+    skew an interleave mask. Falls back to node-dir enumeration where sysfs
+    lacks the file (mbind's EINVAL path still degrades safely there).
+    """
+    try:
+        with open(os.path.join(root, "online"), "r") as fh:
+            nodes = _parse_node_ranges(fh.read())
+    except OSError:
+        nodes = []
+    if nodes:
+        return nodes
+    try:
+        return sorted(
+            int(entry[4:])
+            for entry in os.listdir(root)
+            if entry.startswith("node") and entry[4:].isdigit()
+        )
+    except OSError:
+        return []
+
+
+def _interleave_numa_pages(ptr: int, nbytes: int, name: str) -> None:
+    """Scatter this mapping's first-touch faults evenly over every NUMA node.
+
+    Scoped per mapping via mbind, never process-wide: kt-kernel's per-node
+    expert weight placement is untouched while the engram tables -- read by GPU
+    gather over PCIe from any socket -- want the spread bandwidth. Called
+    before the first touch so pages land interleaved at fault time. Failures
+    degrade to first-touch placement with a warning; never fatal.
+    """
+    nodes = _online_numa_nodes()
+    if len(nodes) < 2:
+        return
+    # Empirically the mbind syscall drops the mask bit at exactly maxnode-1
+    # (nodemask=0xF with maxnode=4 interleaves over 0..2 only), so pass a
+    # full-word maxnode: nodemask=0xF with maxnode=64 covers nodes 0..3.
+    nwords = (nodes[-1] + 1 + 63) // 64
+    mask = (ctypes.c_ulong * nwords)()
+    for node in nodes:
+        mask[node // 64] |= 1 << (node % 64)
+    try:
+        rc = _mbind_interleave(ptr, nbytes, mask, nwords * 64)
+        err = ctypes.get_errno()
+    except (OSError, TypeError, ctypes.ArgumentError, OverflowError) as exc:
+        logger.warning(
+            "engram host table %s: NUMA interleave mbind raised %s; "
+            "falling back to first-touch placement",
+            name,
+            exc,
+        )
+        return
+    if rc != 0:
+        logger.warning(
+            "engram host table %s: NUMA interleave mbind failed (errno %d); "
+            "falling back to first-touch placement",
+            name,
+            err,
+        )
+    else:
+        logger.info(
+            "engram host table %s: NUMA-interleaved %d MiB over nodes %s",
+            name,
+            nbytes // 2**20,
+            nodes,
+        )
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -580,6 +728,8 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+        # Before the first touch as well: interleaved NUMA placement at fault.
+        _interleave_numa_pages(self.bytes.data_ptr(), nbytes, name)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
