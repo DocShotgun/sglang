@@ -142,15 +142,19 @@ class TestBlockFp8AsMxfp8(CustomTestCase):
                 fp8_utils, "resolve_mxfp8_dense_gemm_backend", return_value=cutedsl
             ),
         ):
+            # Non-SM120 Blackwell keeps the Triton block kernel for `auto` and the plain
+            # `cutlass` pre-resolution; explicit FlashInfer backends route.
+            platform.is_sm120 = False
             for name, expected in (
                 ("flashinfer_cutedsl", True),
                 ("flashinfer_cutlass", True),
-                ("flashinfer_trtllm", False),
+                ("flashinfer_trtllm", True),
+                ("cutlass", False),
                 ("triton", False),
                 ("auto", False),
             ):
                 with (
-                    self.subTest(backend=name),
+                    self.subTest(sm120=False, backend=name),
                     patch.object(
                         fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(name)
                     ),
@@ -161,6 +165,30 @@ class TestBlockFp8AsMxfp8(CustomTestCase):
                     self.assertEqual(
                         resolve_block_fp8_mxfp8_backend().is_unsupported(), not expected
                     )
+            # SM120 resolves `auto` and the initialize() pre-resolution (`cutlass`)
+            # to the FlashInfer MXFP8 route; Triton there is an untuned fallback.
+            platform.is_sm120 = True
+            for name, expected in (
+                ("flashinfer_cutedsl", True),
+                ("flashinfer_cutlass", True),
+                ("flashinfer_trtllm", True),
+                ("cutlass", True),
+                ("triton", False),
+                ("auto", True),
+            ):
+                with (
+                    self.subTest(sm120=True, backend=name),
+                    patch.object(
+                        fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(name)
+                    ),
+                ):
+                    self.assertEqual(
+                        can_serve_block_fp8_as_mxfp8([32, 32], "ue8m0"), expected
+                    )
+                    self.assertEqual(
+                        resolve_block_fp8_mxfp8_backend().is_unsupported(), not expected
+                    )
+            platform.is_sm120 = False
             with patch.object(
                 fp8_utils,
                 "FP8_GEMM_RUNNER_BACKEND",

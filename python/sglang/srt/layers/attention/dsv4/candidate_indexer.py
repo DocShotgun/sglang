@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.runtime_context import get_platform
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
@@ -43,8 +46,9 @@ class IndexerInputs:
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
 ) -> Optional[DeepGemmCandidateIndexer]:
-    """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
-    indexer selects through masks inline."""
+    """The paged fp4 decode path's two-level indexer; None where decode selects
+    through masks inline: Hopper always, and SM120-class GPUs whose DeepGEMM
+    build has no sparse MQA logits kernels."""
     if topk_blocks <= 0 or get_platform().device_sm < 100:
         return None
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -52,6 +56,18 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        sm = get_platform().device_sm
+        if sm // 10 != 10:
+            # DeepGEMM ships the paged sparse MQA logits kernels only for the
+            # SM100 family (tcgen05/TMEM). SM120/121 decode selects inline --
+            # full-pool fp4 logits plus top-k, as Hopper always does -- instead
+            # of dying at backend construction.
+            logger.warning(
+                "DeepGEMM paged sparse MQA logits unavailable on SM%d; decode "
+                "selection falls back to inline top-k",
+                sm,
+            )
+            return None
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"

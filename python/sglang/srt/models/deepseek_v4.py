@@ -2725,7 +2725,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
-            and get_platform().is_sm100
+            and (get_platform().is_sm100 or get_platform().is_sm120)
             and self.hc_attn_fn.shape == (24, 20480)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
@@ -2748,6 +2748,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if (
                     getattr(getattr(self, "config", None), "model_type", None)
                     == "deepseek_v41"
+                    and get_platform().is_sm100
                 ):
                     from sglang.kernels.ops.layernorm.mhc import (
                         split_bf16_hc_weight,
@@ -3313,7 +3314,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if (
                     x_flat.shape[0] >= 128
                     and x_flat.is_contiguous()
-                    and get_platform().is_sm100
+                    and (get_platform().is_sm100 or get_platform().is_sm120)
                     and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
                     and not is_batch_invariant_mode_enabled()
                 ):

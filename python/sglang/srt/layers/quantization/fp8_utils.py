@@ -699,7 +699,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
-    if get_platform().is_blackwell and is_flashinfer_available():
+    # The FlashInfer MXFP8 ops are registered at import time only under an
+    # import-time `is_blackwell` check. On a mixed-arch host a rank's device is
+    # set *after* this module is imported, so an SM12x rank that lands on
+    # Blackwell never registered those ops; referencing them here would raise
+    # NameError. Treat "ops not registered in this process" as no FlashInfer
+    # MXFP8 and fall through to the block-fp8 fallback. Same-arch hosts always
+    # have the ops registered here, so they are unaffected.
+    if (
+        get_platform().is_blackwell
+        and is_flashinfer_available()
+        and "_raw_flashinfer_mm_mxfp8" in globals()
+    ):
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
@@ -719,11 +730,27 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
-    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on."""
+    """Resolve the FlashInfer MXFP8 backend for 32-wide-K ue8m0 block-fp8 weights.
+    Requires Blackwell. Consumer Blackwell (SM120) resolves on auto as well:
+    there the Triton block kernel falls back to its untuned default config
+    (no split-K outside SM90), while the FlashInfer MXFP8 GEMMs are natively
+    instantiated for sm120. Other settings keep the block kernel unchanged.
+    """
     backend = get_fp8_gemm_runner_backend()
-    # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
-    # the swizzled scale separately, so the block layout stays readable by Triton.
-    if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
+    # initialize_fp8_gemm_config() pre-resolves `auto` to the plain `cutlass`
+    # runner on SM120, but only for the 128x128 block path. This MXFP8 route is
+    # resolved separately, so on SM120 that pre-resolution must read as `auto`
+    # here; otherwise server processes (which call initialize) differ from
+    # bare imports and the 32-wide-K ue8m0 weights silently fall back to Triton.
+    auto_route = backend.is_auto() or (backend.is_cutlass() and get_platform().is_sm120)
+    if auto_route:
+        if not get_platform().is_sm120:
+            return Mxfp8DenseGemmBackend.UNSUPPORTED
+    elif not (
+        backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_trtllm()
+    ):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
     if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -744,7 +771,12 @@ def can_serve_block_fp8_as_mxfp8(
 
 
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
-    """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    """The MXFP8 linear for the block-fp8 route, with the FlashInfer autotuner kept out
+    of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
+    if backend.is_flashinfer_trtllm():
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="trtllm", pin_tactic=True
+        )
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
@@ -1482,9 +1514,18 @@ def flashinfer_mxfp8_blockscaled_linear(
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time.
 
-    pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
-    reduction order, breaking row-wise batch invariance.
+    pin_tactic skips autotuning and uses the backend heuristic to preserve row-wise
+    batch invariance; tactics tuned per M bucket can change the fp32 reduction order.
     """
+    # An explicit opt-in: retain the selected backend on other architectures,
+    # shapes, and backends. Do not restrict the upstream MXFP8 dispatch to M=1.
+    if (
+        envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH.get()
+        and get_platform().is_sm120
+        and backend == "cutlass"
+        and input.numel() in (input.shape[-1], 4 * input.shape[-1], 6 * input.shape[-1])
+    ):
+        backend = "b12x"
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 

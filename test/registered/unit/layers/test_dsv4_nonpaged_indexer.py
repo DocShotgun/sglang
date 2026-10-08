@@ -894,6 +894,13 @@ class TestCandidateIndexerGating(CustomTestCase):
         with platform(100), patch(flag, False):
             with self.assertRaises(RuntimeError):
                 candidate_indexer.make_candidate_indexer(2048, 8)
+        # SM120/121 have no sparse MQA logits kernels at all: degrade to inline
+        # selection instead of failing.
+        for sm in (120, 121):
+            with platform(sm), patch(flag, False):
+                self.assertIsNone(
+                    candidate_indexer.make_candidate_indexer(2048, 8)
+                )
 
 
 if __name__ == "__main__":

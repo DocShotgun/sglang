@@ -3433,7 +3433,10 @@ class DeepseekV4AttnBackend(
             metadata,
             request_ids=req,  # one per query row; verify rows of a request share one
         )
-        candidate_layer = not _every_request_fits()
+        # No candidate indexer (Hopper, SM120-class): inline top-k selection.
+        candidate_layer = (
+            not _every_request_fits() and self.candidate_indexer is not None
+        )
         # use special selection for candidate layers
         if indexer.uses_candidates and candidate_layer:
             return self.candidate_indexer.select_decode(
