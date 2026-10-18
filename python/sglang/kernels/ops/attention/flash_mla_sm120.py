@@ -16,8 +16,6 @@ import math
 from functools import lru_cache
 from typing import FrozenSet, Optional, Tuple
 
-_kv_compact_scratch = None  # module-level grow-only repack scratch
-
 import torch
 import triton
 import triton.language as tl
@@ -825,21 +823,29 @@ def flashinfer_sparse_mla_forward(
             # forever (the gather never writes it). Under CUDA-graph capture
             # fall back to a fresh allocation so captured addresses stay valid
             # at replay.
-            global _kv_compact_scratch
+            #
+            # Keyed by stream: two forwards running on different streams would
+            # otherwise overwrite each other's rows between the gather and the
+            # kernel. The resource pool is process-wide, like the page-split
+            # buffers above.
             capturing = torch.cuda.is_current_stream_capturing()
-            scratch = None if capturing else _kv_compact_scratch
-            if (
-                scratch is not None
-                and scratch.shape[0] >= n_pad
-                and scratch.device == kv_rows.device
-            ):
+            key = None
+            if not capturing:
+                from sglang.srt.runtime_context import get_resources
+
+                stream = torch.cuda.current_stream(kv_rows.device).cuda_stream
+                key = f"flash_mla_sm120_compact:{kv_rows.device}:{stream}"
+                scratch = get_resources().buffers.get(key)
+            else:
+                scratch = None
+            if scratch is not None and scratch.shape[0] >= n_pad:
                 kv_compact = scratch[:n_pad]
             else:
                 kv_compact = torch.zeros(
                     (n_pad, 656), dtype=torch.uint8, device=kv_rows.device
                 )
-                if not capturing:
-                    _kv_compact_scratch = kv_compact
+                if key is not None:
+                    get_resources().buffers[key] = kv_compact
             for lo in range(0, n_tok, gather_chunk):
                 hi = min(lo + gather_chunk, n_tok)
                 kv_compact[lo:hi, :kv_cache_dim] = kv_rows[flat_idx[lo:hi]]
