@@ -483,21 +483,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 x.shape[0] >= 16  # decode-graph capture runs at bs=1
                 and not torch.cuda.is_current_stream_capturing()
             )
+            # Padding uses -1, which is < num_gpu_experts but is not a GPU
+            # route; keep it out of both branches.
+            gpu_route = (topk_ids >= 0) & (topk_ids < self.num_gpu_experts)
             if compact:
                 gpu_rows, tok_idx = self._gpu_rows_compact(
-                    layer, dispatch_output, topk_output
+                    layer, dispatch_output, topk_output, gpu_route
                 )
                 output = torch.zeros_like(x)
                 if gpu_rows is not None:
                     output.index_add_(0, tok_idx, gpu_rows)
             else:
                 dummy_topk_ids = torch.where(
-                    topk_ids < self.num_gpu_experts,
+                    gpu_route,
                     topk_ids,
                     torch.zeros_like(topk_ids),
                 )
                 dummy_topk_weights = torch.where(
-                    topk_ids < self.num_gpu_experts,
+                    gpu_route,
                     topk_output.topk_weights,
                     torch.zeros_like(topk_output.topk_weights),
                 )
@@ -523,47 +526,50 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return StandardCombineInput(hidden_states=output)
 
-    def _gpu_rows_compact(self, layer, dispatch_output, topk_output):
+    def _gpu_rows_compact(self, layer, dispatch_output, topk_output, gpu_route):
         """Run GPU experts on only the GPU-route rows and return weighted rows.
 
-        Gathers rows routed to GPU experts (id < num_gpu_experts) into a
-        contiguous [R, hidden] batch with topk=1 per row, runs the GPU quant
-        method on it, and returns (weighted_rows, tok_idx) so apply() can
-        scatter-add them back per token. CPU-route rows never reach marlin at
-        all -- no dummy GEMMs -- while marlin keeps its plain all-local
-        semantics (row weights come in via topk_weights as usual). Returns
-        (None, None) when no route hits a GPU expert.
+        Gathers the rows selected by ``gpu_route`` into a contiguous
+        [R, hidden] batch with topk=1 per row, runs the GPU quant method on
+        it, and returns (weighted_rows, tok_idx) so apply() can scatter-add
+        them back per token. CPU-route rows never reach the GPU at all.
+
+        The GPU method is called with unit routing weights and the real
+        weights are applied here. Whether the combine multiplies by
+        topk_weights (marlin's mul_topk_weights) or not is then irrelevant,
+        so the compact path works for every quantization method rather than
+        only the one that happened to be tested. Returns (None, None) when no
+        route hits a GPU expert.
         """
         x = dispatch_output.hidden_states
         topk_ids = topk_output.topk_ids
-        sel = topk_ids < self.num_gpu_experts
         tok_idx = (
             torch.arange(x.shape[0], device=x.device, dtype=torch.long)
             .unsqueeze(1)
             .expand_as(topk_ids)
         )
-        if not bool(sel.any()):
+        if not bool(gpu_route.any()):
             return None, None
-        tok_idx = tok_idx[sel].contiguous()
+        tok_idx = tok_idx[gpu_route].contiguous()
 
-        ids_r = topk_ids[sel].view(-1, 1)
-        w_r = topk_output.topk_weights[sel].view(-1, 1)
+        ids_r = topk_ids[gpu_route].view(-1, 1)
+        w_r = topk_output.topk_weights[gpu_route].view(-1, 1)
+        ones = torch.ones_like(w_r)
         rl = getattr(topk_output, "router_logits", None)
         if rl is not None:
             rows_topk = topk_output._replace(
-                topk_ids=ids_r, topk_weights=w_r, router_logits=rl[tok_idx]
+                topk_ids=ids_r, topk_weights=ones, router_logits=rl[tok_idx]
             )
         else:
-            rows_topk = topk_output._replace(topk_ids=ids_r, topk_weights=w_r)
+            rows_topk = topk_output._replace(topk_ids=ids_r, topk_weights=ones)
 
-        x_rows = x.unsqueeze(1).expand(-1, topk_ids.shape[1], -1)[sel].contiguous()
+        x_rows = x.unsqueeze(1).expand(-1, topk_ids.shape[1], -1)[gpu_route]
         rows_dispatch = dispatch_output._replace(
-            hidden_states=x_rows, topk_output=rows_topk
+            hidden_states=x_rows.contiguous(), topk_output=rows_topk
         )
         combine_in = self.gpu_method.apply(layer, rows_dispatch)
-        # Marlin weights each output row by its routing weight (gemm2
-        # mul_topk_weights), so rows are ready for scatter-add accumulation.
-        return combine_in.hidden_states, tok_idx
+        rows = combine_in.hidden_states * w_r.to(combine_in.hidden_states.dtype)
+        return rows, tok_idx
 
     def _logical_to_physical(self, device):
         cached = self.__dict__.get("_log2phy_cache", "unset")
