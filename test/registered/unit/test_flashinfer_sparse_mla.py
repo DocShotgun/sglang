@@ -48,6 +48,7 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
                 qk_nope_head_dim=192,
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
+                sparse_mla_top_k=4,
                 sm_scale=0.125,
                 skip_softmax_threshold_scale_factor=0.25,
             )

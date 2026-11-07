@@ -756,7 +756,6 @@ def flashinfer_sparse_mla_forward(
 
     topk_capacity = sparse_mla_top_k
     kernel_qk_rope_head_dim = qk_rope_head_dim
-    empty_rows = None
     sparse_mla_top_k_lens = None
     if qk_rope_head_dim == 0:
         from sglang.kernels.ops.attention.dsa.transform_index import (
@@ -778,9 +777,8 @@ def flashinfer_sparse_mla_forward(
             indices = indices[:, :topk_capacity].contiguous()
             sparse_mla_top_k_lens = sparse_mla_top_k_lens.clamp(max=topk_capacity)
 
-        empty_rows = sparse_mla_top_k_lens == 0
-        indices[:, 0] = indices[:, 0].masked_fill(empty_rows, 0)
-        seq_lens = sparse_mla_top_k_lens.clamp(min=1)
+        # Already >= 1: the helper points empty rows at dummy token 0.
+        seq_lens = sparse_mla_top_k_lens
 
     topk_capacity = min(topk_capacity, indices.shape[1])
 
@@ -793,15 +791,20 @@ def flashinfer_sparse_mla_forward(
     kv_u8 = kv_cache.view(torch.uint8)
     kv_rows = kv_u8.view(-1, kv_cache_dim)
 
-    # The repack scratch scales as tokens * sparse_topk * 656 B (compact kv)
-    # plus tokens * sparse_topk * 528 B (gather temp): an 8k-token extend batch
-    # at topk=2048 needs ~11 GiB compact + ~8 GiB gather and OOM'd outright on
-    # SM120 ("Tried to allocate 8.20 GiB" at kv_rows[flat_idx]). Chunk the call
-    # over query tokens so peak scratch stays <= ~4 GiB for any batch size;
-    # decode (1 token) stays a single chunk.
+    # The per-slot gather costs tokens * topk * (656 + 528) B of scratch; chunking
+    # over query tokens caps it at ~4 GiB. It only runs below the pool-repack
+    # threshold, so in practice it is bounded by the pool size as well.
     rows_budget = max(1, (4 << 30) // 656)
     tok_chunk = max(1, rows_budget // max(1, topk_capacity))
     gather_chunk = 1 << 21  # <= ~1 GiB gather temp at 528 B/row
+
+    # Once the call references at least as many (token, topk) slots as the pool
+    # has rows, repacking the whole pool once is cheaper than a per-slot gather
+    # and its scratch is no larger; indices then address the pool unchanged.
+    kv_pool = None
+    if kv_cache_dim != 656 and indices.numel() >= kv_rows.shape[0]:
+        kv_pool = _nope_repack_scratch("pool", kv_rows.shape[0], kv_rows.device)
+        kv_pool[:, :kv_cache_dim].copy_(kv_rows)
 
     outs = []
     for t0 in range(0, indices.shape[0], tok_chunk):
@@ -811,41 +814,15 @@ def flashinfer_sparse_mla_forward(
         if kv_cache_dim == 656:
             kv_arg = kv_u8.view(-1, page_size, kv_cache_dim).unsqueeze(1)
             block_tables = sub_idx.unsqueeze(1)
+        elif kv_pool is not None:
+            kv_arg = kv_pool.view(-1, page_size, 656).unsqueeze(1)
+            # -1 padding sits past seq_lens; clamp it like the gather path does.
+            block_tables = sub_idx.clamp_min(0).unsqueeze(1)
         else:
             flat_idx = sub_idx.reshape(-1).long().clamp_min(0)
             n_tok = flat_idx.numel()
             n_pad = (n_tok + page_size - 1) // page_size * page_size
-            # Grow-only scratch reused across layer-calls: allocating torch.zeros
-            # per call cost 45 x <=4 GiB memset per prefill chunk. Only
-            # [:, :kv_cache_dim] is ever overwritten by the gather, and rows
-            # beyond n_tok are never referenced by block_tables, so stale bytes
-            # are unread -- and the zero rope-footer invariant survives reuse
-            # forever (the gather never writes it). Under CUDA-graph capture
-            # fall back to a fresh allocation so captured addresses stay valid
-            # at replay.
-            #
-            # Keyed by stream: two forwards running on different streams would
-            # otherwise overwrite each other's rows between the gather and the
-            # kernel. The resource pool is process-wide, like the page-split
-            # buffers above.
-            capturing = torch.cuda.is_current_stream_capturing()
-            key = None
-            if not capturing:
-                from sglang.srt.runtime_context import get_resources
-
-                stream = torch.cuda.current_stream(kv_rows.device).cuda_stream
-                key = f"flash_mla_sm120_compact:{kv_rows.device}:{stream}"
-                scratch = get_resources().buffers.get(key)
-            else:
-                scratch = None
-            if scratch is not None and scratch.shape[0] >= n_pad:
-                kv_compact = scratch[:n_pad]
-            else:
-                kv_compact = torch.zeros(
-                    (n_pad, 656), dtype=torch.uint8, device=kv_rows.device
-                )
-                if key is not None:
-                    get_resources().buffers[key] = kv_compact
+            kv_compact = _nope_repack_scratch("compact", n_pad, kv_rows.device)
             for lo in range(0, n_tok, gather_chunk):
                 hi = min(lo + gather_chunk, n_tok)
                 kv_compact[lo:hi, :kv_cache_dim] = kv_rows[flat_idx[lo:hi]]
@@ -880,7 +857,26 @@ def flashinfer_sparse_mla_forward(
         )
         outs.append(result.squeeze(1))
         del kv_arg, result
-    result = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
-    if empty_rows is not None:
-        result.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-    return result
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+
+def _nope_repack_scratch(tag: str, n_rows: int, device: torch.device) -> torch.Tensor:
+    """[n_rows, 656] uint8 scratch for the 528 B -> 656 B NoPE repack.
+
+    Grow-only and reused across layer calls; only [:, :528] is ever written, so
+    the zero rope footer survives reuse. Keyed by stream so forwards on different
+    streams cannot overwrite each other's rows between repack and kernel. Under
+    CUDA-graph capture a fresh allocation keeps captured addresses valid.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros((n_rows, 656), dtype=torch.uint8, device=device)
+    from sglang.srt.runtime_context import get_resources
+
+    stream = torch.cuda.current_stream(device).cuda_stream
+    key = f"flash_mla_sm120_{tag}:{device}:{stream}"
+    buffers = get_resources().buffers
+    scratch = buffers.get(key)
+    if scratch is None or scratch.shape[0] < n_rows:
+        scratch = torch.zeros((n_rows, 656), dtype=torch.uint8, device=device)
+        buffers[key] = scratch
+    return scratch[:n_rows]
