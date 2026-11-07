@@ -14,9 +14,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.arg_groups.overrides import model_config_of
-#from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
-def stream_prefill_for(*args, **kwargs):
-    return None
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
@@ -69,6 +66,20 @@ class KTConfig:
     method: str
     num_layers: Optional[int] = None
     swiglu_limit: float = 0.0
+    # True when the model's router hands KT logical expert ids even under a
+    # non-trivial expert placement, so the wrapper must remap them itself.
+    router_emits_logical_ids: bool = False
+
+
+# Routers that never call topk_ids_logical_to_physical. Every other router remaps
+# whenever --init-expert-location / EPLB set ep_dispatch_algorithm.
+_LOGICAL_ID_ROUTER_ARCHS = frozenset(
+    (
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
+        "DeepseekV4ForCausalLMDSpark",
+    )
+)
 
 
 def create_kt_config_from_server_args(
@@ -95,6 +106,7 @@ def create_kt_config_from_server_args(
     swiglu_limit = float(
         getattr(model_config_of(server_args).hf_config, "swiglu_limit", 0.0) or 0.0
     )
+    architectures = model_config_of(server_args).hf_config.architectures or []
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -107,6 +119,7 @@ def create_kt_config_from_server_args(
         max_deferred_experts_per_token=get_exec().moe.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
         swiglu_limit=swiglu_limit,
+        router_emits_logical_ids=bool(_LOGICAL_ID_ROUTER_ARCHS & set(architectures)),
     )
 
 
@@ -139,19 +152,23 @@ _COMPACT_SCATTER_ROWS = 8192
 
 _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
 _routing_state = {}
-# layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
-# (rank 0); the streamed-prefill zero-copy path hands every layer's expert
-# arenas to the other ranks in one go.
-KT_LAYERS = {}
 
 
-def _routing_count(device, layer_idx, topk_ids, rank):
+# Extra histogram rows past num_hidden_layers for MTP / NextN layers; arbitrary.
+_ROUTING_DUMP_EXTRA_LAYERS = 8
+
+
+def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
     import threading
     import time
 
     st = _routing_state.get(device.index)
     if st is None:
-        counts = torch.zeros((64, 512), dtype=torch.int32, device=device)
+        counts = torch.zeros(
+            ((num_layers or 0) + _ROUTING_DUMP_EXTRA_LAYERS, num_experts),
+            dtype=torch.int32,
+            device=device,
+        )
         ones = torch.ones((1,), dtype=torch.int32, device=device)
         st = _routing_state[device.index] = {"counts": counts, "ones": ones}
 
@@ -168,6 +185,11 @@ def _routing_count(device, layer_idx, topk_ids, rank):
                     print(f"[kt-routing] dump failed: {e}", flush=True)
 
         threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
+    if layer_idx >= st["counts"].shape[0]:
+        raise ValueError(
+            f"KT_ROUTING_DUMP: layer {layer_idx} exceeds the "
+            f"{st['counts'].shape[0]}-row routing histogram"
+        )
     ids = topk_ids.reshape(-1).to(torch.int64)
     st["counts"][layer_idx].index_add_(0, ids, st["ones"].expand(ids.numel()))
 
@@ -292,7 +314,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
             gpu_mask[: self.num_gpu_experts] = True
-            KT_LAYERS[self.kt_config.layer_idx] = self
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -392,7 +413,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
         # never sees the V4 router's ids (09-13); this does.
         if _routing_dump_prefix:
-            _routing_count(x.device, self.kt_config.layer_idx, topk_ids, self.tp_rank)
+            _routing_count(
+                x.device,
+                self.kt_config.layer_idx,
+                topk_ids,
+                self.tp_rank,
+                num_layers=self.kt_config.num_layers,
+                num_experts=self.global_num_experts,
+            )
 
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
@@ -442,10 +470,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         # --init-expert-location moves experts between the GPU slots (physical
-        # 0..num_gpu_experts-1) and the CPU, and both weight loaders honour it,
-        # but the V4 router hands this wrapper *logical* ids (the topk remap in
-        # topk.py only runs with --enable-eplb). Remap here, once per layer,
-        # so a hot-expert placement actually routes to the GPU slots.
+        # 0..num_gpu_experts-1) and the CPU, and both weight loaders honour it.
+        # Most routers remap to physical ids themselves, but the V4 router hands
+        # this wrapper *logical* ids; only then remap here (see KTConfig).
         log2phy = self._logical_to_physical(x.device)
         if log2phy is not None:
             ids = topk_output.topk_ids
@@ -453,15 +480,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             topk_output = topk_output._replace(topk_ids=remapped)
             dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
-        # KT_GPU_STREAM_PREFILL=<tokens>: above that many tokens the CPU
-        # experts are streamed to the GPU in groups instead of computed here
-        # (kt_stream_prefill.py). Keep a separate copy for the streaming path.
-        streamer = stream_prefill_for(self, layer, x.shape[0])
-        if streamer is not None:
-            physical_ids = topk_output.topk_ids.clone()
-
         # Step 1: Submit CPU expert computation (non-blocking)
-        if streamer is None and self.tp_rank == 0:
+        if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
         # Step 2/3: GPU expert computation on VALID GPU routes only.
@@ -495,6 +515,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer, dispatch_output, topk_output, gpu_route
                 )
             else:
+                # Weight 0 zeroes a dummy row only if the GPU method applies
+                # topk_weights (to its output, or to a bias-free expert's input).
                 dummy_topk_ids = torch.where(
                     gpu_route,
                     topk_ids,
@@ -519,9 +541,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             output = torch.zeros_like(x)
 
         # Step 4: Synchronize CPU results and merge with GPU results
-        if streamer is not None:
-            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
-        elif self.tp_rank == 0:
+        if self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
 
@@ -592,7 +612,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         meta = get_global_expert_location_metadata()
         table = None
-        if meta is not None:
+        # Other routers already remapped; a second remap would misroute.
+        if meta is not None and self.kt_config.router_emits_logical_ids:
             m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(device)
             if not torch.equal(m.cpu(), torch.arange(m.numel(), dtype=m.dtype)):
                 table = m.to(torch.int64)
