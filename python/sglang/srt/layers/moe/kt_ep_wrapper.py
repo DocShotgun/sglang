@@ -134,6 +134,9 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     )
 
 
+# Rows per fp32 scatter-add chunk in the compact GPU-route path; arbitrary.
+_COMPACT_SCATTER_ROWS = 8192
+
 _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
 _routing_state = {}
 # layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
@@ -488,12 +491,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # route; keep it out of both branches.
             gpu_route = (topk_ids >= 0) & (topk_ids < self.num_gpu_experts)
             if compact:
-                gpu_rows, tok_idx = self._gpu_rows_compact(
+                output = self._gpu_output_compact(
                     layer, dispatch_output, topk_output, gpu_route
                 )
-                output = torch.zeros_like(x)
-                if gpu_rows is not None:
-                    output.index_add_(0, tok_idx, gpu_rows)
             else:
                 dummy_topk_ids = torch.where(
                     gpu_route,
@@ -527,20 +527,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return StandardCombineInput(hidden_states=output)
 
+    def _gpu_output_compact(self, layer, dispatch_output, topk_output, gpu_route):
+        """Weighted sum of the GPU-route rows per token, accumulated in fp32."""
+        x = dispatch_output.hidden_states
+        rows, w_r, tok_idx = self._gpu_rows_compact(
+            layer, dispatch_output, topk_output, gpu_route
+        )
+        if rows is None:
+            return torch.zeros_like(x)
+        acc = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        # Chunked so the fp32 copy of the rows stays bounded (~200 MiB at 6144).
+        for lo in range(0, rows.shape[0], _COMPACT_SCATTER_ROWS):
+            hi = lo + _COMPACT_SCATTER_ROWS
+            acc.index_add_(0, tok_idx[lo:hi], rows[lo:hi].float() * w_r[lo:hi].float())
+        return acc.to(x.dtype)
+
     def _gpu_rows_compact(self, layer, dispatch_output, topk_output, gpu_route):
-        """Run GPU experts on only the GPU-route rows and return weighted rows.
+        """Run GPU experts on only the GPU-route rows.
 
         Gathers the rows selected by ``gpu_route`` into a contiguous
         [R, hidden] batch with topk=1 per row, runs the GPU quant method on
-        it, and returns (weighted_rows, tok_idx) so apply() can scatter-add
-        them back per token. CPU-route rows never reach the GPU at all.
+        it, and returns (rows, routing_weights, tok_idx) for the caller to
+        weight and scatter-add per token. CPU-route rows never reach the GPU.
 
-        The GPU method is called with unit routing weights and the real
-        weights are applied here. Whether the combine multiplies by
-        topk_weights (marlin's mul_topk_weights) or not is then irrelevant,
-        so the compact path works for every quantization method rather than
-        only the one that happened to be tested. Returns (None, None) when no
-        route hits a GPU expert.
+        The GPU method is called with unit routing weights, so whether its
+        combine multiplies by topk_weights (marlin's mul_topk_weights) or not
+        is irrelevant and the path works for every quantization method.
+        Returns (None, None, None) when no route hits a GPU expert.
         """
         x = dispatch_output.hidden_states
         topk_ids = topk_output.topk_ids
@@ -550,7 +563,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             .expand_as(topk_ids)
         )
         if not bool(gpu_route.any()):
-            return None, None
+            return None, None, None
         tok_idx = tok_idx[gpu_route].contiguous()
 
         ids_r = topk_ids[gpu_route].view(-1, 1)
@@ -569,8 +582,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             hidden_states=x_rows.contiguous(), topk_output=rows_topk
         )
         combine_in = self.gpu_method.apply(layer, rows_dispatch)
-        rows = combine_in.hidden_states * w_r.to(combine_in.hidden_states.dtype)
-        return rows, tok_idx
+        return combine_in.hidden_states, w_r, tok_idx
 
     def _logical_to_physical(self, device):
         cached = self.__dict__.get("_log2phy_cache", "unset")

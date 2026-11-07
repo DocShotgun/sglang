@@ -56,7 +56,7 @@ def test_compact_skips_padding_and_cpu_routes():
     dispatch, topk_output = _dispatch(topk_ids, topk_weights)
     gpu_route = (topk_ids >= 0) & (topk_ids < wrapper.num_gpu_experts)
 
-    rows, tok_idx = wrapper._gpu_rows_compact(
+    rows, route_weights, tok_idx = wrapper._gpu_rows_compact(
         None, dispatch, topk_output, gpu_route
     )
 
@@ -65,10 +65,8 @@ def test_compact_skips_padding_and_cpu_routes():
     # The GPU method must see unit weights: the real weight is applied once,
     # in the scatter, regardless of the method's combine semantics.
     assert torch.equal(wrapper.gpu_method.topk_weights, torch.ones_like(topk_weights[:2]))
-    expected = (
-        dispatch.hidden_states[tok_idx] * 2.0 * topk_weights[1:3]
-    )
-    torch.testing.assert_close(rows, expected)
+    torch.testing.assert_close(rows, dispatch.hidden_states[tok_idx] * 2.0)
+    torch.testing.assert_close(route_weights, topk_weights[1:3])
 
 
 def test_compact_returns_none_without_gpu_routes():
@@ -81,4 +79,31 @@ def test_compact_returns_none_without_gpu_routes():
     assert wrapper._gpu_rows_compact(None, dispatch, topk_output, gpu_route) == (
         None,
         None,
+        None,
     )
+
+
+def test_compact_top_k_sum_accumulates_in_fp32():
+    """Routes of one token must be weighted and summed in fp32 and rounded to the
+    output dtype once: weighting in bf16 misrounds (3.0 * 0.3 gives 0.9023
+    instead of bf16(0.9) = 0.8984), and a bf16 running sum drops small terms
+    (256 + 1 + 1 stays 256 under CUDA bf16 atomics)."""
+    wrapper = _wrapper(num_gpu_experts=3)
+    topk_ids = torch.tensor([[0, 1, 2], [0, 5, 5]])
+    topk_weights = torch.tensor([[1.0, 1.0 / 256, 1.0 / 256], [0.3, 0.5, 0.5]])
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=torch.zeros_like(topk_weights),
+    )
+    hidden = torch.tensor([[128.0] * 4, [1.5] * 4], dtype=torch.bfloat16)
+    dispatch = StandardDispatchOutput(
+        hidden_states=hidden, hidden_states_scale=None, topk_output=topk_output
+    )
+    gpu_route = topk_ids < wrapper.num_gpu_experts
+
+    output = wrapper._gpu_output_compact(None, dispatch, topk_output, gpu_route)
+
+    assert output.dtype == torch.bfloat16
+    exact_token1 = (torch.tensor(3.0) * torch.tensor(0.3)).to(torch.bfloat16).item()
+    assert output.tolist() == [[258.0] * 4, [exact_token1] * 4]
