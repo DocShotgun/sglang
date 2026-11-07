@@ -492,12 +492,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             clamp_limit=self.moe_runner_config.swiglu_limit,
             workspace=layer.workspace,
-            has_masked_experts=(
-                self.moe_runner_config.num_experts is not None
-                and self.moe_runner_config.num_local_experts is not None
-                and self.moe_runner_config.num_local_experts
-                < self.moe_runner_config.num_experts
-            ),
+            # No has_masked_experts: KT passes only valid local expert ids.
         )
         return StandardCombineInput(hidden_states=output)
 

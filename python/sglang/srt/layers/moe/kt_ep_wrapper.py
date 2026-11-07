@@ -463,11 +463,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 2/3: GPU expert computation on VALID GPU routes only.
         #
-        # marlin's EP-capable specialization (-1 routes / expert_ids=-1 blocks)
-        # garbles NVFP4 on SM120 ("17*23" -> "!ththth..."); its plain all-local
+        # Feeding marlin -1 routes through its EP-capable specialization
+        # garbled NVFP4 on SM120 ("17*23" -> "!ththth..."); its plain all-local
         # path is correct (the configuration Lsglang proves). Both strategies
-        # below keep marlin on the plain path and contribute exactly zero for
-        # CPU routes through the top-k reduction:
+        # below hand the GPU method only valid local expert ids, so marlin runs
+        # its plain path (has_masked_experts is never set), and contribute
+        # exactly zero for CPU routes through the top-k reduction:
         #   * compact rows (prefill-sized batches): gather only the GPU-route
         #     rows, run marlin with topk=1 per row, scatter-add the weighted
         #     rows back. GPU MoE flops ~= gpu-route share of traffic instead of
