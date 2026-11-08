@@ -14,7 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _BonusTokenVerifyInput(SpecInput):
@@ -27,6 +27,7 @@ class _BonusTokenVerifyInput(SpecInput):
 class _KVIndexTranslator:
     is_translating = False
     reads_are_translated = False
+    window_kv_kind = IdSpaceKind.FULL
 
     def pack_read_stream(
         self,
