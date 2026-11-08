@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,20 +28,23 @@ class _KVIndexTranslator:
     is_translating = False
     reads_are_translated = False
 
-    def fill_packed_read_stream(
+    def pack_read_stream(
         self,
+        plan,
         *,
         req_pool_indices,
         seq_lens,
         indptr,
-        total_tokens,
         out,
+        kv_start_idx=None,
+        kind=IdSpaceKind.FULL,
     ):
         out.zero_()
+        return False
 
 
 class _SlidingKVIndexTranslator(_KVIndexTranslator):
-    def fill_packed_read_stream(self, **kwargs):
+    def pack_read_stream(self, plan, **kwargs):
         if kwargs.get("kv_start_idx") is not None:
             self.kv_start_idx = kwargs["kv_start_idx"].clone()
         kwargs["out"].zero_()
@@ -101,6 +105,8 @@ def _make_forward_batch(batch_size, spec_info):
         spec_info=spec_info,
         forward_mode=ForwardMode.TARGET_VERIFY,
         out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
+        # A static pool's reads never touch the plan.
+        kv_loc_plan=None,
     )
 
 
@@ -177,6 +183,7 @@ def test_graph_draft_extend_populates_sliding_window_metadata():
     )
     seq_lens = torch.tensor([8, 10], dtype=torch.int64)
     backend._apply_cuda_graph_metadata(
+        plan=None,
         bs=batch_size,
         req_pool_indices=torch.arange(batch_size, dtype=torch.int64),
         seq_lens=seq_lens,

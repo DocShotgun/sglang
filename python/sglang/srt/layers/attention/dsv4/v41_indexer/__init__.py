@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.srt.utils import is_cuda
+
 from .full_topk import FullTopKIndexer
 from .types import (
     CandidateMetadata,
@@ -18,7 +20,6 @@ from .types import (
     DecodeInputs,
     PrefillCandidates,
     PrefillInputs,
-    Selection,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,6 @@ __all__ = [
     "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
-    "Selection",
     "has_dense_fp4_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
@@ -44,8 +44,9 @@ __all__ = [
 
 @functools.cache
 def is_sm100_or_newer() -> bool:
-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper takes the torch indexer.
-    return torch.cuda.get_device_capability()[0] >= 10
+    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
+    # take the torch indexer.
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
 
 
 @functools.cache
