@@ -53,9 +53,10 @@ runtime_base = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
@@ -83,6 +84,7 @@ runtime_common = [
 srt_empty = ["sglang[runtime_base]"]
 
 diffusion_common = [
+  "accelerate",
   "addict",
   "cloudpickle",
   "diffusers==0.37.0",
