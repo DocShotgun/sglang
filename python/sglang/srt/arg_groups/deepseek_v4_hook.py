@@ -388,6 +388,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             not in (Backend.DISABLED, Backend.BREAKABLE),
         ),
         (
+            # A deferred CPU expert's result is added to the next layer's
+            # output; the late layers run only each request's tail rows.
+            "KT deferred experts (--kt-max-deferred-experts-per-token > 0)",
+            cfg.kt_weight_path is not None
+            and (cfg.kt_max_deferred_experts_per_token or 0) > 0,
+        ),
+        (
             "DP attention other than attention TP 1 with supported MoE backends",
             attn_dp_enabled_of(cfg)
             and not (

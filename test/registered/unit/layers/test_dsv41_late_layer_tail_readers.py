@@ -19,7 +19,13 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     late_layer_whole_extend,
 )
 from sglang.srt.model_executor import forward_batch_info
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.arg_groups import deepseek_v4_hook
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -30,7 +36,8 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -382,6 +389,43 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self._run(torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3]), positions, q_lora)
         self.assertTrue(torch.equal(self.index_q_lora.q, q_lora.q[:3]))
         self.assertTrue(torch.equal(self.index_q_lora.scale, q_lora.scale[:3]))
+
+
+_UNIFIED_KV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
+
+
+class TestKtDeferredExpertsResolution(CustomTestCase):
+    """A KT deferred expert's result is added to the next layer's output, but the
+    late layers run only each request's tail rows: deferral keeps decoder SWA
+    bounded replay off, and asking for both is refused."""
+
+    def _resolve(self, deferred, bounded_replay=None):
+        args = ServerArgs(
+            model_path="local-deepseek-v41",
+            attention_backend="dsv4",
+            kt_weight_path="/kt-weights",
+            kt_max_deferred_experts_per_token=deferred,
+            enable_decoder_swa_bounded_replay=bounded_replay,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        with patch(f"{_UNIFIED_KV_GATE}.is_unified_kv_triton", return_value=False):
+            deepseek_v4_hook.validate_deepseek_v41_features(args)
+        return resolving_view(args).enable_decoder_swa_bounded_replay
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_deferral_keeps_bounded_replay_off(self):
+        self.assertTrue(self._resolve(deferred=0))
+        self.assertFalse(self._resolve(deferred=2))
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_bounded_replay_with_deferral_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "KT deferred experts"):
+            self._resolve(deferred=2, bounded_replay=True)
 
 
 if __name__ == "__main__":
