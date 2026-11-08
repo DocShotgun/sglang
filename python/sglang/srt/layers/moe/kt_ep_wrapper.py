@@ -590,17 +590,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         x = dispatch_output.hidden_states
         topk_ids = topk_output.topk_ids
-        tok_idx = (
-            torch.arange(x.shape[0], device=x.device, dtype=torch.long)
-            .unsqueeze(1)
-            .expand_as(topk_ids)
-        )
-        if not bool(gpu_route.any()):
+        # The only host sync: the route count sizes every gather below.
+        route_idx = gpu_route.reshape(-1).nonzero().squeeze(1)
+        if route_idx.numel() == 0:
             return None, None, None
-        tok_idx = tok_idx[gpu_route].contiguous()
+        tok_idx = route_idx // topk_ids.shape[1]
 
-        ids_r = topk_ids[gpu_route].view(-1, 1)
-        w_r = topk_output.topk_weights[gpu_route].view(-1, 1)
+        ids_r = topk_ids.reshape(-1)[route_idx].view(-1, 1)
+        w_r = topk_output.topk_weights.reshape(-1)[route_idx].view(-1, 1)
         ones = torch.ones_like(w_r)
         rl = getattr(topk_output, "router_logits", None)
         if rl is not None:
@@ -610,9 +607,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             rows_topk = topk_output._replace(topk_ids=ids_r, topk_weights=ones)
 
-        x_rows = x.unsqueeze(1).expand(-1, topk_ids.shape[1], -1)[gpu_route]
         rows_dispatch = dispatch_output._replace(
-            hidden_states=x_rows.contiguous(), topk_output=rows_topk
+            hidden_states=x.index_select(0, tok_idx), topk_output=rows_topk
         )
         combine_in = self.gpu_method.apply(layer, rows_dispatch)
         return combine_in.hidden_states, w_r, tok_idx
