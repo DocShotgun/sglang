@@ -169,8 +169,7 @@ def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
             dtype=torch.int32,
             device=device,
         )
-        ones = torch.ones((1,), dtype=torch.int32, device=device)
-        st = _routing_state[device.index] = {"counts": counts, "ones": ones}
+        st = _routing_state[device.index] = {"counts": counts}
 
         def dump():
             while True:
@@ -191,7 +190,9 @@ def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
             f"{st['counts'].shape[0]}-row routing histogram"
         )
     ids = topk_ids.reshape(-1).to(torch.int64)
-    st["counts"][layer_idx].index_add_(0, ids, st["ones"].expand(ids.numel()))
+    # Padded rows route to -1; count them as zero at a valid index so the
+    # shapes stay static under CUDA graph capture.
+    st["counts"][layer_idx].index_add_(0, ids.clamp(min=0), (ids >= 0).to(torch.int32))
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):

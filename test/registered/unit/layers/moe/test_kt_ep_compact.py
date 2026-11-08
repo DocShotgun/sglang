@@ -107,3 +107,22 @@ def test_compact_top_k_sum_accumulates_in_fp32():
     assert output.dtype == torch.bfloat16
     exact_token1 = (torch.tensor(3.0) * torch.tensor(0.3)).to(torch.bfloat16).item()
     assert output.tolist() == [[258.0] * 4, [exact_token1] * 4]
+
+
+def test_routing_dump_ignores_padded_routes(monkeypatch):
+    """KT_ROUTING_DUMP must count padded (-1) routes as nothing; a raw -1 index
+    reaching index_add_ is a device-side assert on CUDA and kills the server."""
+    import threading
+
+    from sglang.srt.layers.moe import kt_ep_wrapper
+
+    # The dump thread would write a file 30 s later; counting is what is tested.
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(kt_ep_wrapper, "_routing_state", {})
+    topk_ids = torch.tensor([[1, -1], [2, 1], [-1, -1]])
+
+    kt_ep_wrapper._routing_count(
+        torch.device("cpu"), 0, topk_ids, rank=0, num_layers=2, num_experts=4
+    )
+
+    assert kt_ep_wrapper._routing_state[None]["counts"][0].tolist() == [0, 2, 1, 0]
