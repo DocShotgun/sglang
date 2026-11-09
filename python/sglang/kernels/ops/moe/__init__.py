@@ -358,3 +358,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.order_rows_within_experts",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.moe_align_stable_order:order_rows_within_experts",
+        capabilities=CUDA_ONLY,
+    )
+)

@@ -5,6 +5,7 @@ from typing import Callable, Optional
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -589,9 +590,8 @@ class TestFusedMarlinMoe(CustomTestCase):
                 self.assertLess(((out - ref).norm() / ref.norm()).item(), 0.02)
 
     def test_fused_marlin_moe_mxfp4_is_reproducible(self):
-        """Identical inputs must give identical bits when an expert spans several
-        M blocks: moe_align orders an expert's rows by atomic arrival, and Marlin
-        rounds a row differently depending on the block that holds it."""
+        """With SGLANG_ENABLE_REPRODUCIBLE_MOE_ALIGN, identical inputs give identical
+        bits, eagerly and from a captured graph, when an expert spans M blocks."""
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
             prepare_moe_mxfp4_layer_for_marlin,
         )
@@ -631,9 +631,16 @@ class TestFusedMarlinMoe(CustomTestCase):
                 is_k_full=True,
             )
 
-        first = run()
+        with envs.SGLANG_ENABLE_REPRODUCIBLE_MOE_ALIGN.override(True):
+            first = run()
+            for _ in range(20):
+                self.assertTrue(torch.equal(run(), first))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
         for _ in range(20):
-            self.assertTrue(torch.equal(run(), first))
+            graph.replay()
+            self.assertTrue(torch.equal(captured, first))
 
 
 if __name__ == "__main__":

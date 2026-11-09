@@ -1522,6 +1522,9 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Marlin MoE: sort each expert's rows by id after moe_align, so repeated
+    # prefills give the same bits (~40 us per eager call); implied by the above.
+    SGLANG_ENABLE_REPRODUCIBLE_MOE_ALIGN = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)
