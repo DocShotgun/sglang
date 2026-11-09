@@ -759,29 +759,25 @@ def flashinfer_sparse_mla_forward(
 
     topk_capacity = sparse_mla_top_k
     kernel_qk_rope_head_dim = qk_rope_head_dim
-    sparse_mla_top_k_lens = None
     if qk_rope_head_dim == 0:
         from sglang.kernels.ops.attention.dsa.transform_index import (
             prepare_trtllm_nope_sparse_metadata,
         )
 
-        sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(indices)
+        # Already >= 1: the helper points empty rows at dummy token 0.
+        seq_lens = prepare_trtllm_nope_sparse_metadata(indices)
         # The SM120 kernel inventory has only the DeepSeek 576-wide query /
         # 64-wide RoPE geometry.  Appending zeros presents that geometry while
         # preserving GLM-5.3's native NoPE math.
         q = torch.nn.functional.pad(q, (0, 64))
         kernel_qk_rope_head_dim = 64
 
-        # index_kpool may reserve overflow columns for an in-progress tail.
-        # The compiled kernel accepts exactly index_topk columns.  KPool now
-        # compacts the tail inside this capacity; keep this guard for old or
-        # graph-captured buffers.
-        if indices.shape[1] > topk_capacity:
-            indices = indices[:, :topk_capacity].contiguous()
-            sparse_mla_top_k_lens = sparse_mla_top_k_lens.clamp(max=topk_capacity)
-
-        # Already >= 1: the helper points empty rows at dummy token 0.
-        seq_lens = sparse_mla_top_k_lens
+    # index_kpool may reserve overflow columns for an in-progress tail, on either
+    # row layout; the compiled kernel accepts exactly index_topk columns. KPool
+    # compacts the tail inside this capacity; this guards old or captured buffers.
+    if indices.shape[1] > topk_capacity:
+        indices = indices[:, :topk_capacity].contiguous()
+        seq_lens = seq_lens.clamp(max=topk_capacity)
 
     topk_capacity = min(topk_capacity, indices.shape[1])
 

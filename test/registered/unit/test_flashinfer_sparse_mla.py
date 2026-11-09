@@ -72,6 +72,45 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (2, 8, 512))
         self.assertTrue(torch.all(output == 2))
 
+    def test_trims_kpool_overflow_columns_on_rope_rows(self):
+        """index_kpool overflow columns past index_topk must not reach the
+        kernel on the 656 B RoPE layout either: it accepts exactly index_topk
+        block-table columns."""
+        captured = {}
+
+        def fake_op(**kwargs):
+            captured.update(kwargs)
+            query = kwargs["query"]
+            return query.new_zeros((*query.shape[:-1], kwargs["kv_lora_rank"]))
+
+        with self._mock_flashinfer(fake_op):
+            flashinfer_sparse_mla_forward(
+                q=torch.zeros((2, 8, 576), dtype=torch.bfloat16),
+                kv_cache=torch.zeros((128, 1, 656), dtype=torch.uint8),
+                indices=torch.tensor(
+                    [[7, 9, 11, 13, 15, -1], [4, 6, -1, -1, -1, -1]],
+                    dtype=torch.int32,
+                ),
+                seq_lens=torch.tensor([5, 2], dtype=torch.int32),
+                workspace_buffer=torch.zeros(1024, dtype=torch.uint8),
+                page_size=64,
+                kv_cache_dim=656,
+                qk_nope_head_dim=192,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                sparse_mla_top_k=4,
+                sm_scale=0.125,
+                skip_softmax_threshold_scale_factor=None,
+            )
+
+        self.assertEqual(
+            captured["block_tables"].tolist(),
+            [[[7, 9, 11, 13]], [[4, 6, -1, -1]]],
+        )
+        self.assertEqual(captured["seq_lens"].tolist(), [4, 2])
+        self.assertEqual(captured["max_seq_len"], 4)
+        self.assertEqual(captured["sparse_mla_top_k"], 4)
+
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):
     def _validate(self, prefill, decode, model_arch="GlmMoeDsaForCausalLM"):
