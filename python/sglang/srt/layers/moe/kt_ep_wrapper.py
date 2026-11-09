@@ -20,7 +20,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -120,30 +119,6 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         swiglu_limit=swiglu_limit,
         router_emits_logical_ids=bool(_LOGICAL_ID_ROUTER_ARCHS & set(architectures)),
-    )
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
-    """Mask CPU expert IDs by setting them to -1.
-
-    This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
-    so they won't be computed on GPU. The masked IDs are set to -1, which causes the
-    GPU MoE kernel to skip those experts.
-
-    Args:
-        topk_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
-        num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
-
-    Returns:
-        A tensor with CPU expert IDs masked as -1
-    """
-    # Do not mutate the router output. The CPU path copies it asynchronously,
-    # and other consumers may still need the original global expert IDs.
-    return torch.where(
-        topk_ids < num_gpu_experts,
-        topk_ids,
-        torch.full_like(topk_ids, -1),
     )
 
 

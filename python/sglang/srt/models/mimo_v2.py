@@ -1258,7 +1258,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-
     # Prefixes for weight routing in encoder_only/language_only modes
     _LANGUAGE_WEIGHT_PREFIXES = ("model.", "lm_head.")
     _VISION_WEIGHT_PREFIXES = ("visual.", "vision_model.")

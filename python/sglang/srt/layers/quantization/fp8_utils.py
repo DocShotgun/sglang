@@ -1917,6 +1917,8 @@ def flashinfer_mxfp8_blockscaled_linear(
     """
     # An explicit opt-in: retain the selected backend on other architectures,
     # shapes, and backends. Do not restrict the upstream MXFP8 dispatch to M=1.
+    # Row counts from Lsglang e0a816bfe: M=1 is one decode row, M=4/6 one request's
+    # DSpark verification at gamma=3/5; b12x was benchmarked faster at M=4/6 only.
     if (
         envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH.get()
         and get_platform().is_sm120
