@@ -516,6 +516,78 @@ class TestFusedMarlinMoe(CustomTestCase):
                         marlin_output, torch_output, atol=5e-2, rtol=0
                     )
 
+    def test_fused_marlin_moe_nvfp4_kt_dummy_rows(self):
+        """NVFP4 gated-SiLU marlin on SM12x, fed the way KT hands it small
+        batches: CPU-routed slots become local expert 0 with routing weight 0
+        and must contribute nothing."""
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("SM12x case; test_moe_wna16_marlin.py covers SM8x/SM9x NVFP4")
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            prepare_moe_nvfp4_layer_for_marlin,
+        )
+        from sglang.test.test_marlin_utils import make_nvfp4_weight_and_ref
+
+        torch.manual_seed(0)
+        local, total, topk, hidden, inter = 6, 32, 8, 512, 256
+        dtype = torch.bfloat16
+        w13 = [make_nvfp4_weight_and_ref(2 * inter, hidden, dtype) for _ in range(local)]
+        w2 = [make_nvfp4_weight_and_ref(hidden, inter, dtype) for _ in range(local)]
+
+        def stacked(parts, field):
+            return torch.nn.Parameter(
+                torch.stack([part[field] for part in parts]), requires_grad=False
+            )
+
+        layer = torch.nn.Module()
+        layer.quant_config = SimpleNamespace(group_size=16)
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        layer.params_dtype = dtype
+        layer.intermediate_size_per_partition = inter
+        layer.w13_weight, layer.w13_weight_scale, layer.w13_weight_scale_2 = (
+            stacked(w13, field) for field in range(3)
+        )
+        layer.w2_weight, layer.w2_weight_scale, layer.w2_weight_scale_2 = (
+            stacked(w2, field) for field in range(3)
+        )
+        prepare_moe_nvfp4_layer_for_marlin(layer)
+        ref13 = torch.stack([part[3] for part in w13])
+        ref2 = torch.stack([part[3] for part in w2])
+
+        for m in (1, 4, 16, 64):
+            with self.subTest(m=m):
+                x = torch.randn(m, hidden, dtype=dtype) / 8
+                logits = torch.randn(m, total)
+                weights, ids = torch.topk(torch.softmax(logits, -1), topk)
+                ids = ids.to(torch.int32)
+                ids[0, 0] = 0  # at least one GPU route
+                gpu = ids < local
+                out = fused_marlin_moe(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    gating_output=logits.to(dtype),
+                    topk_weights=torch.where(gpu, weights, torch.zeros_like(weights)),
+                    topk_ids=torch.where(gpu, ids, torch.zeros_like(ids)),
+                    w1_global_scale=layer.w13_weight_scale_2,
+                    w2_global_scale=layer.w2_weight_scale_2,
+                    workspace=layer.workspace,
+                    num_bits=4,
+                    is_k_full=True,
+                ).float()
+
+                ref = torch.zeros(m, hidden)
+                for token, slot in gpu.nonzero().tolist():
+                    expert = int(ids[token, slot])
+                    gate, up = (x[token] @ ref13[expert].T).float().chunk(2)
+                    act = (torch.nn.functional.silu(gate) * up).to(dtype)
+                    ref[token] += (act @ ref2[expert].T).float() * weights[token, slot]
+                # bf16 intermediates: about 1% normwise.
+                self.assertLess(((out - ref).norm() / ref.norm()).item(), 0.02)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
