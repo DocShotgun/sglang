@@ -429,11 +429,7 @@ class VisionSdpaAttention(nn.Module):
         q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
         k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
         v = v.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
-
-        if self.num_heads != self.num_kv_heads:
-            repeats = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeats, dim=1)
-            v = v.repeat_interleave(repeats, dim=1)
+        enable_gqa = self.num_heads != self.num_kv_heads
 
         s_aux = kwargs.get("s_aux")
         if s_aux is not None:
@@ -459,6 +455,10 @@ class VisionSdpaAttention(nn.Module):
             v = torch.cat((v, torch.zeros_like(v[:, :, :1])), dim=2)
 
         if self.softmax_in_single_precision:
+            if enable_gqa:
+                repeats = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeats, dim=1)
+                v = v.repeat_interleave(repeats, dim=1)
             k = rearrange(k, "b h s d -> b h d s")
             attn_weights = torch.matmul(q, k) * self.scale
             del k
@@ -487,6 +487,7 @@ class VisionSdpaAttention(nn.Module):
                 dropout_p=self.dropout,
                 is_causal=False,
                 scale=self.scale,
+                enable_gqa=enable_gqa,
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
