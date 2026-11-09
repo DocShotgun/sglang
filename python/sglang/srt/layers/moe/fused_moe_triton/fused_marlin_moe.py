@@ -136,6 +136,33 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def _order_rows_within_experts(
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size: int,
+    numel: int,
+) -> torch.Tensor:
+    """moe_align places an expert's rows in atomic arrival order, and Marlin rounds
+    a row differently depending on which M block holds it. Sorting each expert's
+    rows by id makes the output reproducible; every expert keeps its blocks."""
+    device = sorted_token_ids.device
+    positions = torch.arange(sorted_token_ids.numel(), device=device)
+    new_run = torch.ones(expert_ids.shape, dtype=torch.int64, device=device)
+    new_run[1:] = expert_ids[1:] != expert_ids[:-1]
+    run = torch.cumsum(new_run, 0)
+    block = (positions // block_size).clamp(max=expert_ids.numel() - 1)
+    # Padding (id numel) sorts to the end of its expert's run, where moe_align put it.
+    key = run[block] * (numel + 1) + sorted_token_ids.to(torch.int64).clamp(max=numel)
+    # Slots past the padded total stay where they are.
+    key = torch.where(
+        positions < num_tokens_post_padded[0],
+        key,
+        (expert_ids.numel() + 2) * (numel + 1) + positions,
+    )
+    return sorted_token_ids[torch.sort(key, stable=True).indices]
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -273,6 +300,16 @@ def fused_marlin_moe(
             global_num_experts,
             return_inactive_prefix_count=expert_map is None,
         )
+        # ~150 us eager (launch-bound); captured graphs keep the atomic order
+        # rather than pay it on every replay.
+        if not torch.cuda.is_current_stream_capturing():
+            sorted_token_ids = _order_rows_within_experts(
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                block_size=block_size_m,
+                numel=topk_ids.numel(),
+            )
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (

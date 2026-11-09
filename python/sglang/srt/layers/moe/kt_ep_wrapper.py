@@ -543,6 +543,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         if rows is None:
             return torch.zeros_like(x)
+        if x.is_cuda:
+            from sglang.kernels.ops.moe.kt_compact_route_sum import compact_route_sum
+
+            # A fixed per-token order; the scatter-add below is atomic on CUDA,
+            # which makes repeated prefills differ.
+            return compact_route_sum(
+                rows, w_r.view(-1).float(), gpu_route, out_dtype=x.dtype
+            )
         acc = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
         # Chunked so the fp32 copy of the rows stays bounded (~200 MiB at 6144).
         for lo in range(0, rows.shape[0], _COMPACT_SCATTER_ROWS):

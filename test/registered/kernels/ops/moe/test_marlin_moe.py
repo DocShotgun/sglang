@@ -588,6 +588,53 @@ class TestFusedMarlinMoe(CustomTestCase):
                 # bf16 intermediates: about 1% normwise.
                 self.assertLess(((out - ref).norm() / ref.norm()).item(), 0.02)
 
+    def test_fused_marlin_moe_mxfp4_is_reproducible(self):
+        """Identical inputs must give identical bits when an expert spans several
+        M blocks: moe_align orders an expert's rows by atomic arrival, and Marlin
+        rounds a row differently depending on the block that holds it."""
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            prepare_moe_mxfp4_layer_for_marlin,
+        )
+
+        torch.manual_seed(0)
+        experts, hidden, inter, rows = 96, 5120, 2304, 192
+
+        def param(shape, low, high):
+            weight = torch.randint(low, high, shape, dtype=torch.uint8)
+            return torch.nn.Parameter(weight, requires_grad=False)
+
+        layer = torch.nn.Module()
+        layer.w13_weight = param((experts, 2 * inter, hidden // 2), 0, 256)
+        layer.w2_weight = param((experts, hidden, inter // 2), 0, 256)
+        layer.w13_weight_scale = param((experts, 2 * inter, hidden // 32), 118, 124)
+        layer.w2_weight_scale = param((experts, hidden, inter // 32), 118, 124)
+        layer.orig_dtype = torch.bfloat16
+        prepare_moe_mxfp4_layer_for_marlin(layer)
+        # KT's compact rows (top-k 1) with one hot expert, as in real prefills.
+        ids = torch.randint(0, experts, (rows, 1), dtype=torch.int32)
+        ids[torch.randperm(rows)[: rows // 4]] = 7
+        x = (torch.randn(rows, hidden) / 4).to(torch.bfloat16)
+
+        def run():
+            return fused_marlin_moe(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                gating_output=torch.zeros(rows, experts, dtype=torch.bfloat16),
+                topk_weights=torch.ones(rows, 1),
+                topk_ids=ids,
+                global_num_experts=experts,
+                workspace=layer.workspace,
+                num_bits=4,
+                is_k_full=True,
+            )
+
+        first = run()
+        for _ in range(20):
+            self.assertTrue(torch.equal(run(), first))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
