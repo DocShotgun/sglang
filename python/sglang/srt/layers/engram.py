@@ -747,15 +747,14 @@ def _interleave_numa_pages(ptr: int, nbytes: int, name: str) -> None:
     nodes = _online_numa_nodes()
     if len(nodes) < 2:
         return
-    # Empirically the mbind syscall drops the mask bit at exactly maxnode-1
-    # (nodemask=0xF with maxnode=4 interleaves over 0..2 only), so pass a
-    # full-word maxnode: nodemask=0xF with maxnode=64 covers nodes 0..3.
-    nwords = (nodes[-1] + 1 + 63) // 64
-    mask = (ctypes.c_ulong * nwords)()
+    # The kernel reads only maxnode - 1 mask bits (get_nodes() in mm/mempolicy.c),
+    # so maxnode is the highest node id + 2.
+    maxnode = max(nodes) + 2
+    mask = (ctypes.c_ulong * ((maxnode - 1 + 63) // 64))()
     for node in nodes:
         mask[node // 64] |= 1 << (node % 64)
     try:
-        rc = _mbind_interleave(ptr, nbytes, mask, nwords * 64)
+        rc = _mbind_interleave(ptr, nbytes, mask, maxnode)
         err = ctypes.get_errno()
     except (OSError, TypeError, ctypes.ArgumentError, OverflowError) as exc:
         logger.warning(
