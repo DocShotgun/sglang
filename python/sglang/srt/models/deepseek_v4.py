@@ -41,6 +41,15 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
+from sglang.kernels.ops.gemm.dsv4_wo_a_w8a16 import (
+    MAX_GEMM_TOKENS as _W8A16_WO_A_MAX_TOKENS,
+)
+from sglang.kernels.ops.gemm.dsv4_wo_a_w8a16 import (
+    dequantize_to_scratch,
+    requantize_exact,
+    reserve_dequant_scratch,
+    wo_a_w8a16,
+)
 from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
@@ -106,6 +115,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -1540,6 +1550,20 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
         )
+        # Static eligibility; setup_w8a16_wo_a converts only a weight whose fp8
+        # form dequantizes to the same bf16 bits.
+        self.use_w8a16_wo_a = (
+            _is_cuda
+            and get_platform().is_sm120
+            and envs.SGLANG_OPT_DSV4_W8A16_WO_A.get()
+            and not self.wo_a_fp8
+            and not self.use_npu_arch35_mxfp8_wo_a
+            and not self.use_fused_wo_a
+            and not self.use_mega_attention
+        )
+        # (fp8 e4m3 [G, R, D], fp32 [G, R/32, D/32]) once converted, when
+        # wo_a.weight is left empty.
+        self.wo_a_w8a16: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
 
@@ -1591,6 +1615,55 @@ class MQALayer(MqaAttentionBase):
                 method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+
+    def setup_w8a16_wo_a(self) -> None:
+        if (
+            not self.use_w8a16_wo_a
+            or self.wo_a_w8a16 is not None
+            or not isinstance(self.wo_a.quant_method, UnquantizedLinearMethod)
+        ):
+            return
+        weight = self.wo_a.weight
+        exact = requantize_exact(weight.data)
+        if exact is None:
+            logger.warning(
+                "wo_a of layer %d has no exact fp8 form; keeping it in bf16",
+                self.layer_id,
+            )
+            return
+        codes, scales = exact
+        groups, rank = self.n_local_groups, self.o_lora_rank
+        self.wo_a_w8a16 = (
+            codes.view(groups, rank, -1),
+            scales.view(groups, rank // 32, -1),
+        )
+        reserve_dequant_scratch(self.wo_a_w8a16[0].shape, weight.device)
+        weight.data = weight.data.new_empty(0)
+
+    def restore_bf16_wo_a(self) -> None:
+        """Rebuild wo_a.weight bit for bit from its fp8 form, so a weight
+        reload can write into it; setup_w8a16_wo_a converts it again."""
+        if self.wo_a_w8a16 is None:
+            return
+        restored = dequantize_to_scratch(*self.wo_a_w8a16).flatten(0, 1).clone()
+        self.wo_a.weight.data = restored
+        self.wo_a_w8a16 = None
+
+    def _apply_wo_a_w8a16(
+        self, o: torch.Tensor, forward_batch: ForwardBatch, fuse_mxfp8_quant: bool
+    ):
+        codes, scales = self.wo_a_w8a16
+        if o.shape[0] <= _W8A16_WO_A_MAX_TOKENS:
+            return wo_a_w8a16(o, codes, scales)
+        return _apply_wo_a_bf16_matmul(
+            o,
+            dequantize_to_scratch(codes, scales),
+            is_decode=forward_batch.forward_mode.is_decode(),
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
+            fast_path=self.is_dsv41,
+            fuse_mxfp8_quant=fuse_mxfp8_quant,
+        )
 
     def accepts_deepgemm_mxfp8_input(self) -> bool:
         return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
@@ -3022,6 +3095,8 @@ class MQALayer(MqaAttentionBase):
                     self.wo_a.weight_scale_inv.data,
                     recipe=recipe,
                 )
+            elif self.wo_a_w8a16 is not None:
+                o = self._apply_wo_a_w8a16(o, forward_batch, fuse_mxfp8_quant)
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
@@ -5069,6 +5144,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         for module in self.modules():
             if isinstance(module, MQALayer):
                 module.setup_mega_attention()
+                module.setup_w8a16_wo_a()
 
         if is_nextn:
             return
@@ -5255,6 +5331,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        for module in self.modules():
+            if isinstance(module, MQALayer):
+                module.restore_bf16_wo_a()
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
