@@ -384,6 +384,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.wo_a_w8a16",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a_w8a16:wo_a_w8a16",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",

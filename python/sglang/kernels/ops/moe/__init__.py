@@ -350,3 +350,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.compact_route_sum",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.kt_compact_route_sum:compact_route_sum",
+        capabilities=CUDA_ONLY,
+    )
+)
