@@ -139,35 +139,42 @@ def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
 
     st = _routing_state.get(device.index)
     if st is None:
-        counts = torch.zeros(
-            ((num_layers or 0) + _ROUTING_DUMP_EXTRA_LAYERS, num_experts),
-            dtype=torch.int32,
-            device=device,
-        )
-        st = _routing_state[device.index] = {"counts": counts}
+        shape = ((num_layers or 0) + _ROUTING_DUMP_EXTRA_LAYERS, num_experts)
+        st = _routing_state[device.index] = {
+            "prefill": torch.zeros(shape, dtype=torch.int32, device=device),
+            "decode": torch.zeros(shape, dtype=torch.int32, device=device),
+        }
 
         def dump():
             while True:
                 time.sleep(30)
                 try:
-                    c = st["counts"].cpu()
+                    prefill, decode = st["prefill"].cpu(), st["decode"].cpu()
                     torch.save(
-                        {"rank": rank, "logical_count": c},
+                        {
+                            "rank": rank,
+                            "logical_count": prefill + decode,
+                            "prefill_count": prefill,
+                            "decode_count": decode,
+                        },
                         f"{_routing_dump_prefix}-rank{rank}.pt",
                     )
                 except Exception as e:  # never take the scheduler down for a dump
                     print(f"[kt-routing] dump failed: {e}", flush=True)
 
         threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
-    if layer_idx >= st["counts"].shape[0]:
+    if layer_idx >= st["prefill"].shape[0]:
         raise ValueError(
             f"KT_ROUTING_DUMP: layer {layer_idx} exceeds the "
-            f"{st['counts'].shape[0]}-row routing histogram"
+            f"{st['prefill'].shape[0]}-row routing histogram"
         )
+    # One-row calls are bs=1 decode steps (and rare one-token extends);
+    # batched decode lands in the prefill histogram.
+    counts = st["decode" if topk_ids.shape[0] == 1 else "prefill"]
     ids = topk_ids.reshape(-1).to(torch.int64)
     # Padded rows route to -1; count them as zero at a valid index so the
     # shapes stay static under CUDA graph capture.
-    st["counts"][layer_idx].index_add_(0, ids.clamp(min=0), (ids >= 0).to(torch.int32))
+    counts[layer_idx].index_add_(0, ids.clamp(min=0), (ids >= 0).to(torch.int32))
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):

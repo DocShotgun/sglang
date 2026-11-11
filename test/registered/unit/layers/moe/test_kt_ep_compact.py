@@ -125,4 +125,27 @@ def test_routing_dump_ignores_padded_routes(monkeypatch):
         torch.device("cpu"), 0, topk_ids, rank=0, num_layers=2, num_experts=4
     )
 
-    assert kt_ep_wrapper._routing_state[None]["counts"][0].tolist() == [0, 2, 1, 0]
+    assert kt_ep_wrapper._routing_state[None]["prefill"][0].tolist() == [0, 2, 1, 0]
+    assert kt_ep_wrapper._routing_state[None]["decode"][0].tolist() == [0, 0, 0, 0]
+
+
+def test_routing_dump_counts_single_row_calls_as_decode(monkeypatch):
+    import threading
+
+    from sglang.srt.layers.moe import kt_ep_wrapper
+
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(kt_ep_wrapper, "_routing_state", {})
+    for ids in ([[1, 3]], [[2, 1], [1, 0]]):
+        kt_ep_wrapper._routing_count(
+            torch.device("cpu"),
+            1,
+            torch.tensor(ids),
+            rank=0,
+            num_layers=2,
+            num_experts=4,
+        )
+
+    state = kt_ep_wrapper._routing_state[None]
+    assert state["decode"][1].tolist() == [0, 1, 0, 1]
+    assert state["prefill"][1].tolist() == [1, 2, 1, 0]
