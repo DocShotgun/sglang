@@ -36,6 +36,7 @@ def _wrapper(num_gpu_experts=2, gpu_expert_slots=None):
     wrapper.num_gpu_experts = num_gpu_experts
     wrapper.gpu_expert_slots = gpu_expert_slots
     wrapper._gpu_slot_table = None
+    wrapper.routed_output_scale = None
     wrapper.gpu_method = _RecordingGpuMethod()
     return wrapper
 
@@ -368,3 +369,18 @@ def test_gpu_runner_gets_no_routed_scale():
     )
     wrapper.create_moe_runner(None, MoeRunnerConfig(routed_scaling_factor=2.5))
     assert seen == {"scale": None}
+
+
+@pytest.mark.parametrize("tp_rank, scale", [(0, 2.5), (1, 2.5), (1, None)])
+def test_merge_without_cpu_experts_scales_once(tp_rank, scale, monkeypatch):
+    """Ranks that run no CPU experts (tp_rank > 0, or no KT wrapper) still apply the
+    routed scale the model handed over, exactly once; None leaves the output as is."""
+    wrapper = _wrapper()
+    wrapper.tp_rank = tp_rank
+    wrapper.wrapper = None
+    wrapper.routed_output_scale = scale
+    monkeypatch.setattr(KTEPWrapperMethod, "sync", lambda self, x: torch.zeros_like(x))
+    gpu_output = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.bfloat16)
+    expected = gpu_output.clone() if scale is None else gpu_output * scale
+    merged = wrapper._merge_cpu_output(gpu_output.clone(), gpu_output.clone())
+    assert torch.equal(merged, expected)

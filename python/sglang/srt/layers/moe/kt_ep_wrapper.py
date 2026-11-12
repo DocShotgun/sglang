@@ -353,6 +353,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # experts; None means experts 0..num_gpu_experts-1 in slots 0..N-1.
         self.gpu_expert_slots: Optional[torch.Tensor] = None
         self._gpu_slot_table: Optional[torch.Tensor] = None
+        # Set by a model that hands this method its routed-output multiply; the merge
+        # of the CPU experts' output applies it (None: the output is not scaled here).
+        self.routed_output_scale: Optional[float] = None
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
@@ -697,12 +700,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             gpu_combine_input = None
             output = torch.zeros_like(x)
 
-        # Step 4: Synchronize CPU results and merge with GPU results
-        if self.tp_rank == 0:
-            cpu_output = self.sync(x)
-            output = output + cpu_output
+        return StandardCombineInput(hidden_states=self._merge_cpu_output(x, output))
 
-        return StandardCombineInput(hidden_states=output)
+    def _merge_cpu_output(
+        self, x: torch.Tensor, gpu_output: torch.Tensor
+    ) -> torch.Tensor:
+        """The GPU experts' output plus the CPU experts', times routed_output_scale."""
+        scale = self.routed_output_scale
+        if self.tp_rank == 0 and self.wrapper is not None:
+            return self.wrapper.sync_forward_merged(
+                x,
+                torch.cuda.current_stream(x.device).cuda_stream,
+                gpu_output,
+                scale,
+            )
+        if self.tp_rank == 0:
+            gpu_output = gpu_output + self.sync(x)
+        if scale is not None:
+            gpu_output *= scale
+        return gpu_output
 
     def _gpu_output_compact(self, layer, dispatch_output, topk_output, gpu_route):
         """Weighted sum of the GPU-route rows per token, accumulated in fp32."""

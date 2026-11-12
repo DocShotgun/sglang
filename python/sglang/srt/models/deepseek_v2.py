@@ -1007,6 +1007,15 @@ class DeepseekV2MoE(nn.Module):
         # KT's GPU and CPU experts both weight their rows by topk_weights and neither
         # applies the routed scale, so their sum needs it unless the router has.
         self._is_kt = isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        # The merge of the CPU experts' output applies it on the forward_normal paths;
+        # a2a and two-batch overlap keep the multiply here.
+        kt_needs_scale = self._is_kt and not self.routed_scaling_factor_fused_in_topk
+        kt_merge_scales = (
+            kt_needs_scale and not self._enable_a2a_moe and not is_tbo_enabled()
+        )
+        if kt_merge_scales:
+            self.experts.quant_method.routed_output_scale = self.routed_scaling_factor
+        self._kt_model_scales_routed_output = kt_needs_scale and not kt_merge_scales
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1234,7 +1243,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
         if (
-            not self.routed_scaling_factor_fused_in_topk
+            self._kt_model_scales_routed_output
             if self._is_kt
             else (
                 not _is_cuda
@@ -1419,7 +1428,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_output,
             )
         if (
-            not self.routed_scaling_factor_fused_in_topk
+            self._kt_model_scales_routed_output
             if self._is_kt
             else (
                 not _is_cuda
