@@ -1004,6 +1004,9 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        # KT's GPU and CPU experts both weight their rows by topk_weights and neither
+        # applies the routed scale, so their sum needs it unless the router has.
+        self._is_kt = isinstance(self.experts.quant_method, KTEPWrapperMethod)
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1231,10 +1234,13 @@ class DeepseekV2MoE(nn.Module):
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
         if (
-            not _is_cuda
-            and not _is_musa
-            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            not self.routed_scaling_factor_fused_in_topk
+            if self._is_kt
+            else (
+                not _is_cuda
+                and not _is_musa
+                and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1413,11 +1419,14 @@ class DeepseekV2MoE(nn.Module):
                 topk_output,
             )
         if (
-            not _is_cuda
-            and not _is_musa
-            and not _is_xpu
-            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            not self.routed_scaling_factor_fused_in_topk
+            if self._is_kt
+            else (
+                not _is_cuda
+                and not _is_musa
+                and not _is_xpu
+                and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
 

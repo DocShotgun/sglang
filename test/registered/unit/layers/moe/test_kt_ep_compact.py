@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatchOutput,
 )
@@ -354,3 +355,16 @@ def test_profile_accepts_the_default_options():
         kt_expert_profile="p.pt", kt_max_deferred_experts_per_token=0
     ):
         kt_ep_wrapper._check_expert_profile_args()
+
+
+def test_gpu_runner_gets_no_routed_scale():
+    """The CPU experts never apply routed_scaling_factor; a GPU runner handed it would
+    weight the GPU experts by it twice once the model scales their sum."""
+    wrapper = _wrapper()
+    wrapper.override_num_local_experts = False
+    seen = {}
+    wrapper.gpu_method.create_moe_runner = lambda layer, config: seen.update(
+        scale=config.routed_scaling_factor
+    )
+    wrapper.create_moe_runner(None, MoeRunnerConfig(routed_scaling_factor=2.5))
+    assert seen == {"scale": None}

@@ -522,6 +522,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         if self.override_num_local_experts:
             moe_runner_config.num_local_experts = self.num_gpu_experts
+        # The CPU experts never apply routed_scaling_factor, so the GPU runner must not
+        # either; the sum is scaled once, by the router's weights or the model.
+        moe_runner_config.routed_scaling_factor = None
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, moe_runner_config)
 
