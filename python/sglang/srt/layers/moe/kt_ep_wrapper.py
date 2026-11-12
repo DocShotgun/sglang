@@ -7,6 +7,8 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
+import functools
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -35,6 +37,8 @@ try:
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
     KTRANSFORMERS_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,6 +72,8 @@ class KTConfig:
     # True when the model's router hands KT logical expert ids even under a
     # non-trivial expert placement, so the wrapper must remap them itself.
     router_emits_logical_ids: bool = False
+    # --kt-expert-profile: picks each layer's GPU experts (None: 0..N-1).
+    expert_profile: Optional[str] = None
 
 
 # Routers that never call topk_ids_logical_to_physical. Every other router remaps
@@ -106,6 +112,11 @@ def create_kt_config_from_server_args(
         getattr(model_config_of(server_args).hf_config, "swiglu_limit", 0.0) or 0.0
     )
     architectures = model_config_of(server_args).hf_config.architectures or []
+    expert_profile = get_exec().moe.kt_expert_profile
+    if expert_profile is not None:
+        _check_expert_profile_args()
+        if not get_exec().moe.kt_num_gpu_experts:
+            _warn_profile_unused(expert_profile)
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -119,7 +130,114 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         swiglu_limit=swiglu_limit,
         router_emits_logical_ids=bool(_LOGICAL_ID_ROUTER_ARCHS & set(architectures)),
+        expert_profile=expert_profile,
     )
+
+
+def _check_expert_profile_args() -> None:
+    moe = get_exec().moe
+    # The profile places experts with logical ids on one rank; an expert-location
+    # mapping would permute the ids it ranks, and deferral is unverified with it.
+    if moe.init_expert_location != "trivial" or moe.enable_eplb:
+        raise ValueError(
+            "--kt-expert-profile cannot be combined with --init-expert-location or "
+            "--enable-eplb"
+        )
+    if moe.ep_num_redundant_experts or get_parallel().moe_ep_size > 1:
+        raise ValueError(
+            "--kt-expert-profile needs expert parallel size 1 and no redundant experts"
+        )
+    if (moe.kt_max_deferred_experts_per_token or 0) > 0:
+        raise ValueError(
+            "--kt-expert-profile does not support --kt-max-deferred-experts-per-token > 0"
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_profile_unused(path: str) -> None:
+    logger.warning("--kt-expert-profile %s is unused: --kt-num-gpu-experts is 0", path)
+
+
+def _load_expert_profile(path: str, num_layers: int, num_experts: int):
+    """Return ([num_layers, num_experts] float64 routing counts, the key they came from)."""
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(data, dict):
+        key = next((k for k in ("decode_count", "logical_count") if k in data), None)
+        if key is None:
+            raise ValueError(f"{path}: no decode_count or logical_count entry")
+        counts = data[key]
+    else:
+        key, counts = "tensor", data
+    if not isinstance(counts, torch.Tensor):
+        raise ValueError(f"{path}: {key} is not a tensor")
+    # [buffer, layers, experts], as sglang's expert distribution recorder saves it.
+    if counts.dim() == 3:
+        counts = counts.sum(dim=0)
+    if counts.dim() != 2 or counts.shape[1] != num_experts:
+        raise ValueError(
+            f"{path}: {key} has shape {tuple(counts.shape)}, expected "
+            f"[{num_layers}, {num_experts}]"
+        )
+    # Dumps saved before the histogram was trimmed keep its spare MTP rows.
+    if counts.shape[0] == num_layers + _ROUTING_DUMP_EXTRA_LAYERS:
+        counts = counts[:num_layers]
+    if counts.shape[0] != num_layers:
+        raise ValueError(
+            f"{path}: {key} has {counts.shape[0]} layers, the model has {num_layers}"
+        )
+    counts = counts.to(torch.float64)
+    if bool((counts < 0).any()):
+        raise ValueError(f"{path}: {key} has negative counts")
+    return counts, key
+
+
+@functools.lru_cache(maxsize=None)
+def _expert_profile_slots(
+    path: str, num_layers: int, num_experts: int, num_gpu_experts: int
+) -> torch.Tensor:
+    """[num_layers, num_experts] int32 GPU slot of each expert, -1 for CPU experts.
+
+    Each layer keeps its num_gpu_experts most-routed experts (ties to the lower
+    id) in slots ordered by expert id; layers without routes get -1 rows.
+    """
+    counts, key = _load_expert_profile(path, num_layers, num_experts)
+    top = torch.sort(counts, dim=1, descending=True, stable=True).indices
+    # Explicit CPU: model construction runs under a CUDA default device.
+    gpu = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
+    gpu.scatter_(1, top[:, :num_gpu_experts], True)
+    routed = counts.sum(dim=1) > 0
+    gpu &= routed.unsqueeze(1)
+    slots = torch.where(gpu, gpu.cumsum(dim=1, dtype=torch.int32) - 1, -1).to(
+        torch.int32
+    )
+    total = counts[routed].sum(dim=1)
+    placed = (counts * gpu)[routed].sum(dim=1) / total
+    today = counts[routed, :num_gpu_experts].sum(dim=1) / total
+    logger.info(
+        "KT expert profile %s (%s, %d routed layers): its GPU experts take %.1f%% of "
+        "the profile's routes per layer on average, against %.1f%% for experts 0..%d",
+        path,
+        key,
+        int(routed.sum()),
+        100 * placed.mean().item() if total.numel() else 0.0,
+        100 * today.mean().item() if total.numel() else 0.0,
+        num_gpu_experts - 1,
+    )
+    return slots
+
+
+def _layer_gpu_slots(
+    path: str, layer_idx: int, num_layers: int, num_experts: int, num_gpu_experts: int
+) -> Optional[torch.Tensor]:
+    """This layer's [num_experts] GPU slots, or None when they are experts 0..N-1."""
+    slots = _expert_profile_slots(path, num_layers, num_experts, num_gpu_experts)
+    row = slots[layer_idx]
+    if bool((row < 0).all()):
+        raise ValueError(f"{path}: no routes recorded for MoE layer {layer_idx}")
+    identity = torch.arange(num_gpu_experts, dtype=row.dtype, device=row.device)
+    if torch.equal(row[:num_gpu_experts], identity):
+        return None
+    return row.clone()
 
 
 # Rows per fp32 scatter-add chunk in the compact GPU-route path; arbitrary.
@@ -133,6 +251,23 @@ _routing_state = {}
 _ROUTING_DUMP_EXTRA_LAYERS = 8
 
 
+def _routing_snapshot(st, rank):
+    """The dump file: [num_hidden_layers, experts] counts, plus MTP rows if any."""
+    prefill, decode = st["prefill"].cpu(), st["decode"].cpu()
+    n = st["num_layers"] or prefill.shape[0]
+    snap = {
+        "rank": rank,
+        "logical_count": prefill[:n] + decode[:n],
+        "prefill_count": prefill[:n],
+        "decode_count": decode[:n],
+    }
+    extra = prefill[n:] + decode[n:]
+    if bool(extra.any()):
+        # Rows for layer ids num_hidden_layers.. (MTP / NextN draft layers).
+        snap["extra_layer_count"] = extra
+    return snap
+
+
 def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
     import threading
     import time
@@ -143,20 +278,15 @@ def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
         st = _routing_state[device.index] = {
             "prefill": torch.zeros(shape, dtype=torch.int32, device=device),
             "decode": torch.zeros(shape, dtype=torch.int32, device=device),
+            "num_layers": num_layers,
         }
 
         def dump():
             while True:
                 time.sleep(30)
                 try:
-                    prefill, decode = st["prefill"].cpu(), st["decode"].cpu()
                     torch.save(
-                        {
-                            "rank": rank,
-                            "logical_count": prefill + decode,
-                            "prefill_count": prefill,
-                            "decode_count": decode,
-                        },
+                        _routing_snapshot(st, rank),
                         f"{_routing_dump_prefix}-rank{rank}.pt",
                     )
                 except Exception as e:  # never take the scheduler down for a dump
@@ -181,8 +311,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
     This wrapper coordinates parallel execution of:
-    - GPU experts (0 to num_gpu_experts-1) using any quantization method
-    - CPU experts (num_gpu_experts to total_experts-1) using AMX/AVX instructions
+    - GPU experts (0 to num_gpu_experts-1, or each layer's most-routed experts
+      under --kt-expert-profile) using any quantization method
+    - CPU experts (all others) using AMX/AVX instructions
 
     The wrapper implements the submit-compute-sync pattern:
     1. Submit CPU expert computation (non-blocking)
@@ -218,6 +349,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_parallel().tp_rank
+        # [num_experts] int32 GPU weight slot of each logical expert, -1 for CPU
+        # experts; None means experts 0..num_gpu_experts-1 in slots 0..N-1.
+        self.gpu_expert_slots: Optional[torch.Tensor] = None
+        self._gpu_slot_table: Optional[torch.Tensor] = None
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
@@ -265,8 +400,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             layer_max_deferred = 0
 
+        # Draft (MTP) layers load without expert-location metadata, so the
+        # weight loader's slot remap would not run for them; they keep 0..N-1.
+        if (
+            self.kt_config.expert_profile is not None
+            and layer.uses_expert_location
+            and 0 < self.num_gpu_experts < num_experts
+        ):
+            if self.kt_config.num_layers is None:
+                raise ValueError("--kt-expert-profile needs num_hidden_layers in the config")
+            self.gpu_expert_slots = _layer_gpu_slots(
+                self.kt_config.expert_profile,
+                self.kt_config.layer_idx,
+                self.kt_config.num_layers,
+                num_experts,
+                self.num_gpu_experts,
+            )
+
         # 1. Create weights for GPU experts using the wrapped method
-        # GPU experts: 0 to num_gpu_experts-1
+        # GPU weight slots 0..num_gpu_experts-1 (see gpu_expert_slot)
         # ModelOpt (NVFP4) methods size their tensors from
         # layer.num_local_experts instead of the num_experts argument, which
         # would allocate every routed expert on the GPU (~4.5 GiB/layer for
@@ -289,14 +441,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer.num_local_experts = saved_num_local_experts
 
         # 2. Initialize KT wrapper for CPU experts
-        # CPU experts: num_gpu_experts to num_experts-1
+        # CPU experts: every expert without a GPU slot
         # An all-GPU placement has no CPU weights or CPU work to initialize.
         if self.tp_rank == 0 and self.num_gpu_experts < num_experts:
             # kt-kernel 0.7.0 inference API takes an explicit boolean mask of
             # GPU-resident experts instead of num_gpu_experts (SFT-only).
-            # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
-            gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
-            gpu_mask[: self.num_gpu_experts] = True
+            if self.gpu_expert_slots is not None:
+                gpu_mask = self.gpu_expert_slots >= 0
+            else:
+                gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+                gpu_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -333,6 +487,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and self.num_gpu_experts > 0
         ):
             self.gpu_method.process_weights_after_loading(layer)
+        # Built here, not on first use, so no host copy lands in graph capture.
+        if self.gpu_expert_slots is not None:
+            param = next(layer.parameters(), None)
+            self._build_gpu_slot_table(
+                param.device if param is not None else torch.device("cpu")
+            )
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
@@ -495,16 +655,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         #     to expert id 0 with routing weight 0; marlin computes weighted-zero
         #     rows. Static shapes only -- decode graph capture (bs=1) must never
         #     take data-dependent branches, hence the token gate + capture check.
-        topk_ids = topk_output.topk_ids
-
         if self.num_gpu_experts > 0:
             compact = (
                 x.shape[0] >= 16  # decode-graph capture runs at bs=1
                 and not torch.cuda.is_current_stream_capturing()
             )
-            # Padding uses -1, which is < num_gpu_experts but is not a GPU
-            # route; keep it out of both branches.
-            gpu_route = (topk_ids >= 0) & (topk_ids < self.num_gpu_experts)
+            # The GPU method sees GPU weight slots; the CPU above got expert ids.
+            topk_ids, gpu_route = self._gpu_routes(topk_output.topk_ids)
+            if topk_ids is not topk_output.topk_ids:
+                topk_output = topk_output._replace(topk_ids=topk_ids)
             if compact:
                 output = self._gpu_output_compact(
                     layer, dispatch_output, topk_output, gpu_route
@@ -602,6 +761,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         combine_in = self.gpu_method.apply(layer, rows_dispatch)
         return combine_in.hidden_states, w_r, tok_idx
+
+    def gpu_expert_slot(self, expert_id: int) -> int:
+        """GPU weight slot of expert ``expert_id``, or -1 when it runs on the CPU."""
+        if self.gpu_expert_slots is None:
+            return expert_id if expert_id < self.num_gpu_experts else -1
+        return int(self.gpu_expert_slots[expert_id])
+
+    def _gpu_routes(self, topk_ids: torch.Tensor):
+        """Return (GPU-method expert ids, GPU-route mask) for ``topk_ids``."""
+        if self.gpu_expert_slots is None:
+            # Padding uses -1, which is < num_gpu_experts but is not a GPU
+            # route; keep it out of both branches.
+            return topk_ids, (topk_ids >= 0) & (topk_ids < self.num_gpu_experts)
+        table = self._gpu_slot_table
+        if table is None or table.device != topk_ids.device:
+            table = self._build_gpu_slot_table(topk_ids.device)
+        slots = table[topk_ids]
+        if slots.dtype != topk_ids.dtype:
+            slots = slots.to(topk_ids.dtype)
+        return slots, slots >= 0
+
+    def _build_gpu_slot_table(self, device) -> torch.Tensor:
+        # One extra -1 entry: padding ids (-1) index it, so they stay off the GPU.
+        self._gpu_slot_table = torch.cat(
+            [self.gpu_expert_slots, self.gpu_expert_slots.new_full((1,), -1)]
+        ).to(device)
+        return self._gpu_slot_table
 
     def _logical_to_physical(self, device):
         cached = self.__dict__.get("_log2phy_cache", "unset")

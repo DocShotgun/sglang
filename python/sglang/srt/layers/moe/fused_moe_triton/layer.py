@@ -1256,8 +1256,12 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
+                slot = self.quant_method.gpu_expert_slot(expert_id)
+                if slot < 0:
                     return
+                # Global-expert parameters keep the checkpoint expert's row.
+                if not getattr(param, "_sglang_require_global_experts", False):
+                    expert_id = slot
 
         self._weight_loader_impl(
             param=param,

@@ -1034,6 +1034,14 @@ class ExecMoe(msgspec.Struct):
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
     ] = None
+    kt_expert_profile: A[
+        Optional[str],
+        "[ktransformers parameter] Expert routing-count profile (.pt) from KT_ROUTING_DUMP or "
+        "sglang's expert distribution recorder. Each MoE layer keeps its --kt-num-gpu-experts "
+        "most-routed experts (by decode counts when the file has them) on the GPU instead of "
+        "experts 0..N-1. Expert ids stay logical; cannot be combined with "
+        "--init-expert-location or EPLB.",
+    ] = None
 
 
 class ExecOverlap(msgspec.Struct):
