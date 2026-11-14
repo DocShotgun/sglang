@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_parallel,
     get_schedule,
 )
@@ -100,6 +101,10 @@ def create_kt_config_from_server_args(
         KTConfig if KT is configured, None otherwise
     """
     if get_exec().moe.kt_weight_path is None:
+        return None
+    # Draft MoE stays on the GPU: kt-kernel loads CPU experts from
+    # model.layers.{layer_idx}, which names a target layer for draft layer ids.
+    if get_flags().moe.in_speculative_scope:
         return None
 
     num_layers = getattr(

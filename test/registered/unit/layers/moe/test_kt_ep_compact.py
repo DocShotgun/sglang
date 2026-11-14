@@ -384,3 +384,18 @@ def test_merge_without_cpu_experts_scales_once(tp_rank, scale, monkeypatch):
     expected = gpu_output.clone() if scale is None else gpu_output * scale
     merged = wrapper._merge_cpu_output(gpu_output.clone(), gpu_output.clone())
     assert torch.equal(merged, expected)
+
+
+def test_draft_moe_gets_no_kt_config(monkeypatch):
+    """A draft's MoE stays on the GPU: kt-kernel would load its CPU experts from the
+    target layer with the same id."""
+    from sglang.srt.layers.moe.utils import draft_model_build_scope
+
+    hf_config = SimpleNamespace(num_hidden_layers=2, architectures=[], swiglu_limit=0.0)
+    monkeypatch.setattr(
+        kt_ep_wrapper, "model_config_of", lambda _: SimpleNamespace(hf_config=hf_config)
+    )
+    with get_context().override_server_args(kt_weight_path="/weights"):
+        assert kt_ep_wrapper.create_kt_config_from_server_args(None, 0) is not None
+        with draft_model_build_scope():
+            assert kt_ep_wrapper.create_kt_config_from_server_args(None, 0) is None
