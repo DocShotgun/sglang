@@ -479,5 +479,45 @@ class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
                 self._run(dtype)
 
 
+
+class TestSm120B12xSmallBatchGate(CustomTestCase):
+    """SGLANG_SM120_MXFP8_B12X_SMALL_BATCH sends SM120 MXFP8 GEMMs of 1..8 rows to
+    b12x, the DSpark draft block's 5 rows included; larger GEMMs keep cutlass."""
+
+    def _backend_for(self, rows):
+        k, n = 64, 32
+        seen = {}
+
+        def fake_mm(a, b, a_scale, b_scale, out_dtype, use_8x4_sf_layout, backend):
+            seen["backend"] = backend
+            return torch.zeros(a.shape[0], b.shape[1], dtype=out_dtype)
+
+        with (
+            patch.object(fp8_utils, "flashinfer_mm_mxfp8", fake_mm),
+            patch.object(
+                fp8_utils, "get_platform", return_value=SimpleNamespace(is_sm120=True)
+            ),
+            patch.object(
+                fp8_utils.envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH,
+                "get",
+                return_value=True,
+            ),
+        ):
+            fp8_utils.flashinfer_mxfp8_blockscaled_linear(
+                input=torch.zeros(rows, k, dtype=torch.float8_e4m3fn),
+                weight=torch.zeros(n, k, dtype=torch.float8_e4m3fn),
+                weight_scale=torch.zeros(n, k // 32, dtype=torch.uint8),
+                input_scale=torch.zeros(rows, k // 32, dtype=torch.uint8),
+                output_dtype=torch.bfloat16,
+            )
+        return seen["backend"]
+
+    def test_rows_up_to_8_take_b12x(self):
+        for rows in range(1, 9):
+            with self.subTest(rows=rows):
+                self.assertEqual(self._backend_for(rows), "b12x")
+        self.assertEqual(self._backend_for(9), "cutlass")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1899,6 +1899,11 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+# Rows up to which SGLANG_SM120_MXFP8_B12X_SMALL_BATCH routes MXFP8 GEMMs to b12x; only
+# M=1..8 was measured.
+_B12X_SMALL_BATCH_MAX_ROWS = 8
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1916,14 +1921,14 @@ def flashinfer_mxfp8_blockscaled_linear(
     batch invariance; tactics tuned per M bucket can change the fp32 reduction order.
     """
     # An explicit opt-in: retain the selected backend on other architectures,
-    # shapes, and backends. Do not restrict the upstream MXFP8 dispatch to M=1.
-    # Row counts from Lsglang e0a816bfe: M=1 is one decode row, M=4/6 one request's
-    # DSpark verification at gamma=3/5; b12x was benchmarked faster at M=4/6 only.
+    # shapes, and backends. Measured on RTX PRO 6000 with DSv4.1's dense shapes:
+    # b12x beats cutlass at every M in 1..8, 1.2-12x per shape and 7x over a
+    # layer's six GEMMs (a DSpark draft block runs M=5, its verification M=6).
     if (
         envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH.get()
         and get_platform().is_sm120
         and backend == "cutlass"
-        and input.numel() in (input.shape[-1], 4 * input.shape[-1], 6 * input.shape[-1])
+        and 0 < input.numel() <= _B12X_SMALL_BATCH_MAX_ROWS * input.shape[-1]
     ):
         backend = "b12x"
     input_2d = input.view(-1, input.shape[-1])
