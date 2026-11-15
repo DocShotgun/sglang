@@ -1204,6 +1204,20 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+def _draft_block_host_seq_lens(
+    seq_lens: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]
+) -> List[int]:
+    """Host lengths for a DSpark draft block. Without host lengths, CUDA gets
+    placeholders: they reach only ExpandPrefillCausally, whose CUDA kernel reads the
+    device lengths, and a device read would sync every step and fail the metadata
+    glue-graph capture. The torch reference path does read them."""
+    if seq_lens_cpu is not None:
+        return [int(x) for x in seq_lens_cpu.tolist()]
+    if seq_lens.is_cuda:
+        return [0] * seq_lens.shape[0]
+    return seq_lens.tolist()
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -2211,10 +2225,7 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
-            seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
+        seq_lens_cpu_list = _draft_block_host_seq_lens(seq_lens, seq_lens_cpu)
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu_list,
