@@ -251,15 +251,10 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
-    # The SM120 sparse-MLA prefill specialization requires page_block_size=64
-    # for BOTH sources (the decode path accepts native page sizes).  V4.1
-    # ratio-1/2/c128 extra pools use 128/256-token pages, so split them the
-    # same way as the main source.  Pools with pages SMALLER than 64 (V4/0731
-    # ratio-4: 16-token pages) pass through untouched -- the kernel's page
-    # addressing is page-size-generic for those, exactly like the decode path.
-    # Token indices are invariant under the split; the persistent scratch is
-    # keyed per role so converting the extra source can never clobber the main
-    # source's buffer (or vice versa).
+    # The SM120 prefill kernel needs 64-token pages for both sources (decode takes
+    # native sizes). V4.1's ratio-1/2/c128 extra pools use 128/256-token pages, so
+    # split them like the main source; smaller pages (ratio-4: 16) pass through.
+    # Token indices survive the split, and each source has its own scratch buffer.
     if (
         extra_kv_u8 is not None
         and extra_kv_u8.ndim >= 3
@@ -781,12 +776,9 @@ def flashinfer_sparse_mla_forward(
 
     topk_capacity = min(topk_capacity, indices.shape[1])
 
-    # GLM-5.3-Flash native-NoPE packed rows are 512 fp8 latent + 16 B scales
-    # (528 B/token).  The v32/GLM kernel consumes 656 B/token =
-    # nope_fp8(512) + per-group scales(16) + rope_bf16(128).  The rope slot is
-    # unread: q's appended rope block is zeros, so rope dot products vanish and
-    # GLM-5.3's native NoPE math is preserved exactly.  Compact the referenced
-    # rows into a page-aligned scratch cache and append the zero rope footer.
+    # GLM-5.3-Flash NoPE rows are 528 B (512 fp8 latent + 16 B scales); the kernel
+    # reads 656 B rows, adding a 128 B bf16 RoPE slot that q's zero RoPE block cancels.
+    # Compact the referenced rows into page-aligned scratch with a zero RoPE footer.
     kv_u8 = kv_cache.view(torch.uint8)
     kv_rows = kv_u8.view(-1, kv_cache_dim)
 
@@ -843,10 +835,8 @@ def flashinfer_sparse_mla_forward(
             seq_lens=sub_seq_lens,
             max_seq_len=topk_capacity,
             sparse_mla_top_k=topk_capacity,
-            # Once the NoPE tensors are padded to the DeepSeek RoPE64 geometry,
-            # FlashInfer selects the compiled RoPE64 kernel.  Its active lengths
-            # are carried by seq_lens; the native-NoPE-only metadata argument must
-            # stay unset or the public wrapper rejects the call before dispatch.
+            # Padded to the RoPE64 geometry, FlashInfer runs its RoPE64 kernel with the
+            # lengths in seq_lens; this NoPE-only argument must stay unset.
             sparse_mla_top_k_lens=None,
             bmm1_scale=float(sm_scale),
             bmm2_scale=1.0,
