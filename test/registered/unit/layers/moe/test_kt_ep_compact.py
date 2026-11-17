@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.moe import kt_ep_wrapper
+from sglang.srt.layers.moe import kt_ep_wrapper, kt_expert_placement
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -125,30 +125,36 @@ def test_routing_dump_ignores_padded_routes(monkeypatch):
     reaching index_add_ is a device-side assert on CUDA and kills the server."""
     import threading
 
-    from sglang.srt.layers.moe import kt_ep_wrapper
-
     # The dump thread would write a file 30 s later; counting is what is tested.
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
-    monkeypatch.setattr(kt_ep_wrapper, "_routing_state", {})
+    monkeypatch.setattr(kt_expert_placement, "_routing_state", {})
     topk_ids = torch.tensor([[1, -1], [2, 1], [-1, -1]])
 
-    kt_ep_wrapper._routing_count(
+    kt_expert_placement.count_routes(
         torch.device("cpu"), 0, topk_ids, rank=0, num_layers=2, num_experts=4
     )
 
-    assert kt_ep_wrapper._routing_state[None]["prefill"][0].tolist() == [0, 2, 1, 0]
-    assert kt_ep_wrapper._routing_state[None]["decode"][0].tolist() == [0, 0, 0, 0]
+    assert kt_expert_placement._routing_state[None]["prefill"][0].tolist() == [
+        0,
+        2,
+        1,
+        0,
+    ]
+    assert kt_expert_placement._routing_state[None]["decode"][0].tolist() == [
+        0,
+        0,
+        0,
+        0,
+    ]
 
 
 def test_routing_dump_counts_single_row_calls_as_decode(monkeypatch):
     import threading
 
-    from sglang.srt.layers.moe import kt_ep_wrapper
-
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
-    monkeypatch.setattr(kt_ep_wrapper, "_routing_state", {})
+    monkeypatch.setattr(kt_expert_placement, "_routing_state", {})
     for ids in ([[1, 3]], [[2, 1], [1, 0]]):
-        kt_ep_wrapper._routing_count(
+        kt_expert_placement.count_routes(
             torch.device("cpu"),
             1,
             torch.tensor(ids),
@@ -157,7 +163,7 @@ def test_routing_dump_counts_single_row_calls_as_decode(monkeypatch):
             num_experts=4,
         )
 
-    state = kt_ep_wrapper._routing_state[None]
+    state = kt_expert_placement._routing_state[None]
     assert state["decode"][1].tolist() == [0, 1, 0, 1]
     assert state["prefill"][1].tolist() == [1, 2, 1, 0]
 
@@ -174,7 +180,9 @@ def test_profile_prefers_decode_counts(tmp_path):
     logical = torch.tensor([[9, 0, 0, 0], [9, 0, 0, 0]])
     path = _save(tmp_path, {"decode_count": decode, "logical_count": logical})
 
-    counts, key = kt_ep_wrapper._load_expert_profile(path, num_layers=2, num_experts=4)
+    counts, key = kt_expert_placement._load_expert_profile(
+        path, num_layers=2, num_experts=4
+    )
 
     assert key == "decode_count"
     assert torch.equal(counts, decode.double())
@@ -184,18 +192,24 @@ def test_profile_accepts_recorder_and_legacy_dump_shapes(tmp_path):
     # sglang's expert distribution recorder (and old KT): [buffer, layers, experts].
     recorder = torch.arange(2 * 3 * 4).view(2, 3, 4)
     path = _save(tmp_path, {"logical_count": recorder}, "recorder.pt")
-    counts, _ = kt_ep_wrapper._load_expert_profile(path, num_layers=3, num_experts=4)
+    counts, _ = kt_expert_placement._load_expert_profile(
+        path, num_layers=3, num_experts=4
+    )
     assert torch.equal(counts, recorder.sum(0).double())
 
     # Earlier KT_ROUTING_DUMP files carry the spare MTP rows.
-    extra = kt_ep_wrapper._ROUTING_DUMP_EXTRA_LAYERS
+    extra = kt_expert_placement._ROUTING_DUMP_EXTRA_LAYERS
     legacy = torch.ones(3 + extra, 4, dtype=torch.int32)
     path = _save(tmp_path, {"decode_count": legacy}, "legacy.pt")
-    counts, _ = kt_ep_wrapper._load_expert_profile(path, num_layers=3, num_experts=4)
+    counts, _ = kt_expert_placement._load_expert_profile(
+        path, num_layers=3, num_experts=4
+    )
     assert counts.shape == (3, 4)
 
     path = _save(tmp_path, torch.ones(3, 4), "raw.pt")
-    counts, key = kt_ep_wrapper._load_expert_profile(path, num_layers=3, num_experts=4)
+    counts, key = kt_expert_placement._load_expert_profile(
+        path, num_layers=3, num_experts=4
+    )
     assert key == "tensor" and counts.shape == (3, 4)
 
 
@@ -211,7 +225,7 @@ def test_profile_accepts_recorder_and_legacy_dump_shapes(tmp_path):
 def test_profile_rejects_a_mismatched_file(tmp_path, obj, message):
     path = _save(tmp_path, obj)
     with pytest.raises(ValueError, match=message):
-        kt_ep_wrapper._load_expert_profile(path, num_layers=3, num_experts=4)
+        kt_expert_placement._load_expert_profile(path, num_layers=3, num_experts=4)
 
 
 def test_profile_slots_take_the_most_routed_experts_in_id_order(tmp_path):
@@ -220,7 +234,7 @@ def test_profile_slots_take_the_most_routed_experts_in_id_order(tmp_path):
     counts = torch.tensor([[5, 1, 5, 0, 9, 0], [0, 0, 0, 0, 0, 0]])
     path = _save(tmp_path, {"decode_count": counts})
 
-    slots = kt_ep_wrapper._expert_profile_slots(path, 2, 6, 2)
+    slots = kt_expert_placement._expert_profile_slots(path, 2, 6, 2)
 
     assert slots[0].tolist() == [0, -1, -1, -1, 1, -1]
     assert slots[1].tolist() == [-1] * 6
@@ -234,7 +248,7 @@ def test_profile_slots_ignore_the_default_device(tmp_path):
     path = _save(tmp_path, {"decode_count": counts})
 
     with torch.device("meta"):
-        slots = kt_ep_wrapper._layer_gpu_slots(path, 0, 2, 6, 2)
+        slots = kt_expert_placement.layer_gpu_slots(path, 0, 2, 6, 2)
 
     assert slots.device.type == "cpu"
     assert slots.tolist() == [0, -1, -1, -1, 1, -1]
@@ -245,10 +259,15 @@ def test_profile_layer_slots_none_for_experts_0_to_n_and_error_without_routes(tm
     counts = torch.tensor([[7, 6, 0, 1], [0, 0, 0, 0], [0, 1, 0, 9]])
     path = _save(tmp_path, {"decode_count": counts})
 
-    assert kt_ep_wrapper._layer_gpu_slots(path, 0, 3, 4, 2) is None
-    assert kt_ep_wrapper._layer_gpu_slots(path, 2, 3, 4, 2).tolist() == [-1, 0, -1, 1]
+    assert kt_expert_placement.layer_gpu_slots(path, 0, 3, 4, 2) is None
+    assert kt_expert_placement.layer_gpu_slots(path, 2, 3, 4, 2).tolist() == [
+        -1,
+        0,
+        -1,
+        1,
+    ]
     with pytest.raises(ValueError, match="no routes recorded for MoE layer 1"):
-        kt_ep_wrapper._layer_gpu_slots(path, 1, 3, 4, 2)
+        kt_expert_placement.layer_gpu_slots(path, 1, 3, 4, 2)
 
 
 def test_gpu_expert_slot_for_the_weight_loader():
@@ -320,7 +339,7 @@ def test_apply_compact_rows_send_slots():
 
 def test_routing_snapshot_saves_exact_layers_and_extra_rows():
     """Dump files hold num_hidden_layers rows, so profiles match the model exactly."""
-    extra = kt_ep_wrapper._ROUTING_DUMP_EXTRA_LAYERS
+    extra = kt_expert_placement._ROUTING_DUMP_EXTRA_LAYERS
     st = {
         "prefill": torch.zeros(2 + extra, 3, dtype=torch.int32),
         "decode": torch.zeros(2 + extra, 3, dtype=torch.int32),
@@ -329,14 +348,14 @@ def test_routing_snapshot_saves_exact_layers_and_extra_rows():
     st["prefill"][1, 2] = 4
     st["decode"][0, 1] = 7
 
-    snap = kt_ep_wrapper._routing_snapshot(st, rank=0)
+    snap = kt_expert_placement._routing_snapshot(st, rank=0)
     assert snap["decode_count"].tolist() == [[0, 7, 0], [0, 0, 0]]
     assert snap["prefill_count"].tolist() == [[0, 0, 0], [0, 0, 4]]
     assert snap["logical_count"].tolist() == [[0, 7, 0], [0, 0, 4]]
     assert "extra_layer_count" not in snap
 
     st["decode"][2, 0] = 1  # a draft layer with id num_hidden_layers
-    snap = kt_ep_wrapper._routing_snapshot(st, rank=0)
+    snap = kt_expert_placement._routing_snapshot(st, rank=0)
     assert snap["extra_layer_count"][0].tolist() == [1, 0, 0]
     assert snap["decode_count"].shape == (2, 3)
 
@@ -351,14 +370,14 @@ def test_routing_snapshot_saves_exact_layers_and_extra_rows():
 def test_profile_rejects_conflicting_options(fields, message):
     with get_context().override_server_args(kt_expert_profile="p.pt", **fields):
         with pytest.raises(ValueError, match=message):
-            kt_ep_wrapper._check_expert_profile_args()
+            kt_expert_placement.check_expert_profile_args()
 
 
 def test_profile_accepts_the_default_options():
     with get_context().override_server_args(
         kt_expert_profile="p.pt", kt_max_deferred_experts_per_token=0
     ):
-        kt_ep_wrapper._check_expert_profile_args()
+        kt_expert_placement.check_expert_profile_args()
 
 
 def test_gpu_runner_gets_no_routed_scale():
