@@ -10,6 +10,8 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 import functools
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -70,22 +72,8 @@ class KTConfig:
     method: str
     num_layers: Optional[int] = None
     swiglu_limit: float = 0.0
-    # True when the model's router hands KT logical expert ids even under a
-    # non-trivial expert placement, so the wrapper must remap them itself.
-    router_emits_logical_ids: bool = False
     # --kt-expert-profile: picks each layer's GPU experts (None: 0..N-1).
     expert_profile: Optional[str] = None
-
-
-# Routers that never call topk_ids_logical_to_physical. Every other router remaps
-# whenever --init-expert-location / EPLB set ep_dispatch_algorithm.
-_LOGICAL_ID_ROUTER_ARCHS = frozenset(
-    (
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForCausalLMNextN",
-        "DeepseekV4ForCausalLMDSpark",
-    )
-)
 
 
 def create_kt_config_from_server_args(
@@ -116,7 +104,6 @@ def create_kt_config_from_server_args(
     swiglu_limit = float(
         getattr(model_config_of(server_args).hf_config, "swiglu_limit", 0.0) or 0.0
     )
-    architectures = model_config_of(server_args).hf_config.architectures or []
     expert_profile = get_exec().moe.kt_expert_profile
     if expert_profile is not None:
         _check_expert_profile_args()
@@ -134,7 +121,6 @@ def create_kt_config_from_server_args(
         max_deferred_experts_per_token=get_exec().moe.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
         swiglu_limit=swiglu_limit,
-        router_emits_logical_ids=bool(_LOGICAL_ID_ROUTER_ARCHS & set(architectures)),
         expert_profile=expert_profile,
     )
 
@@ -274,9 +260,6 @@ def _routing_snapshot(st, rank):
 
 
 def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
-    import threading
-    import time
-
     st = _routing_state.get(device.index)
     if st is None:
         shape = ((num_layers or 0) + _ROUTING_DUMP_EXTRA_LAYERS, num_experts)
@@ -295,7 +278,7 @@ def _routing_count(device, layer_idx, topk_ids, rank, num_layers, num_experts):
                         f"{_routing_dump_prefix}-rank{rank}.pt",
                     )
                 except Exception as e:  # never take the scheduler down for a dump
-                    print(f"[kt-routing] dump failed: {e}", flush=True)
+                    logger.warning("KT_ROUTING_DUMP: saving failed: %s", e)
 
         threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
     if layer_idx >= st["prefill"].shape[0]:
@@ -428,14 +411,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
         # 1. Create weights for GPU experts using the wrapped method
-        # GPU weight slots 0..num_gpu_experts-1 (see gpu_expert_slot)
-        # ModelOpt (NVFP4) methods size their tensors from
-        # layer.num_local_experts instead of the num_experts argument, which
-        # would allocate every routed expert on the GPU (~4.5 GiB/layer for
-        # GLM-5.3-Flash) and OOM during weight creation. Mask the attribute
-        # for the duration of the call so every method allocates the GPU
-        # slice only; _weight_loader_physical additionally skips checkpoint
-        # experts >= num_gpu_experts at load time.
+        # GPU weight slots 0..num_gpu_experts-1 (see gpu_expert_slot). ModelOpt (NVFP4)
+        # methods size their tensors from layer.num_local_experts, not num_experts,
+        # and would allocate every routed expert on the GPU; mask it for the call.
         saved_num_local_experts = layer.num_local_experts
         layer.num_local_experts = self.num_gpu_experts
         try:
@@ -475,9 +453,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
                 swiglu_limit=self.kt_config.swiglu_limit,
-                # KT_NUMA_NODES="1" pins a single pool to node 1, the node
-                # that does not host the TP0 scheduler, for the prefill-decay
-                # isolation; unset keeps kt-kernel's sequential default.
+                # KT_NUMA_NODES=<id,...>: NUMA nodes of the CPU expert pools;
+                # unset keeps kt-kernel's sequential default.
                 numa_nodes=(
                     [int(x) for x in os.environ["KT_NUMA_NODES"].split(",")]
                     if os.environ.get("KT_NUMA_NODES")
@@ -569,11 +546,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
-        # KT_ROUTING_DUMP=<prefix>: accumulate a [layers, experts] histogram of
-        # the routed expert ids on the GPU (a captured index_add_, so it keeps
-        # counting under CUDA graph replay) and save it as
-        # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
-        # never sees the V4 router's ids (09-13); this does.
+        # KT_ROUTING_DUMP=<prefix>: a [layers, experts] histogram of the routed ids,
+        # counted on the GPU (graph replays count too), saved to <prefix>-rank<r>.pt
+        # every 30 s. sglang's expert distribution recorder never sees V4's router ids.
         if _routing_dump_prefix:
             _routing_count(
                 x.device,
@@ -637,39 +612,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        # --init-expert-location moves experts between the GPU slots (physical
-        # 0..num_gpu_experts-1) and the CPU, and both weight loaders honour it.
-        # Most routers remap to physical ids themselves, but the V4 router hands
-        # this wrapper *logical* ids; only then remap here (see KTConfig).
-        log2phy = self._logical_to_physical(x.device)
-        if log2phy is not None:
-            ids = topk_output.topk_ids
-            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(
-                ids.dtype
-            )
-            topk_output = topk_output._replace(topk_ids=remapped)
-            dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
-        # Step 2/3: GPU expert computation on VALID GPU routes only.
-        #
-        # Feeding marlin -1 routes through its EP-capable specialization
-        # garbled NVFP4 on SM120 ("17*23" -> "!ththth..."); its plain all-local
-        # path is correct (the configuration Lsglang proves). Both strategies
-        # below hand the GPU method only valid local expert ids, so marlin runs
-        # its plain path (it never sees a -1 route), and contribute
-        # exactly zero for CPU routes through the top-k reduction:
-        #   * compact rows (prefill-sized batches): gather only the GPU-route
-        #     rows, run marlin with topk=1 per row, scatter-add the weighted
-        #     rows back. GPU MoE flops ~= gpu-route share of traffic instead of
-        #     all M*topk rows.
-        #   * dummy rows (small batches / CUDA-graph decode): remap CPU routes
-        #     to expert id 0 with routing weight 0; marlin computes weighted-zero
-        #     rows. Static shapes only -- decode graph capture (bs=1) must never
-        #     take data-dependent branches, hence the token gate + capture check.
+        # Step 2/3: GPU expert computation on valid GPU routes only. Marlin's EP
+        # path garbles NVFP4 on SM120 when it sees -1 routes, so both strategies
+        # hand the GPU method only local expert ids and add exactly zero for CPU routes:
+        #   * compact rows (prefill-sized batches): only the GPU-route rows, topk=1;
+        #   * dummy rows (decode, graph capture): CPU routes become expert 0 with
+        #     weight 0, keeping shapes static.
         if self.num_gpu_experts > 0:
             compact = (
                 x.shape[0] >= 16  # decode-graph capture runs at bs=1
@@ -706,7 +659,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
                 output = gpu_combine_input.hidden_states
         else:
-            gpu_combine_input = None
             output = torch.zeros_like(x)
 
         return StandardCombineInput(hidden_states=self._merge_cpu_output(x, output))
@@ -723,8 +675,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_output,
                 scale,
             )
-        if self.tp_rank == 0:
-            gpu_output = gpu_output + self.sync(x)
         if scale is not None:
             gpu_output *= scale
         return gpu_output
@@ -776,7 +726,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ids_r = topk_ids.reshape(-1)[route_idx].view(-1, 1)
         w_r = topk_output.topk_weights.reshape(-1)[route_idx].view(-1, 1)
         ones = torch.ones_like(w_r)
-        rl = getattr(topk_output, "router_logits", None)
+        rl = topk_output.router_logits
         if rl is not None:
             rows_topk = topk_output._replace(
                 topk_ids=ids_r, topk_weights=ones, router_logits=rl[tok_idx]
@@ -816,24 +766,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             [self.gpu_expert_slots, self.gpu_expert_slots.new_full((1,), -1)]
         ).to(device)
         return self._gpu_slot_table
-
-    def _logical_to_physical(self, device):
-        cached = self.__dict__.get("_log2phy_cache", "unset")
-        if cached != "unset":
-            return cached
-        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-
-        meta = get_global_expert_location_metadata()
-        table = None
-        # Other routers already remapped; a second remap would misroute.
-        if meta is not None and self.kt_config.router_emits_logical_ids:
-            m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(
-                device
-            )
-            if not torch.equal(m.cpu(), torch.arange(m.numel(), dtype=m.dtype)):
-                table = m.to(torch.int64)
-        self.__dict__["_log2phy_cache"] = table
-        return table
 
     def __getattr__(self, name: str):
         """Delegate attribute access to the wrapped GPU method.

@@ -288,7 +288,6 @@ def test_gpu_routes_map_experts_to_slots(device, dtype):
 def _gpu_only_wrapper(gpu_expert_slots):
     wrapper = _wrapper(gpu_expert_slots=gpu_expert_slots)
     wrapper.tp_rank = 1  # no CPU work on this rank
-    wrapper.__dict__["_log2phy_cache"] = None
     return wrapper
 
 
@@ -376,14 +375,13 @@ def test_gpu_runner_gets_no_routed_scale():
 
 
 @pytest.mark.parametrize("tp_rank, scale", [(0, 2.5), (1, 2.5), (1, None)])
-def test_merge_without_cpu_experts_scales_once(tp_rank, scale, monkeypatch):
+def test_merge_without_cpu_experts_scales_once(tp_rank, scale):
     """Ranks that run no CPU experts (tp_rank > 0, or no KT wrapper) still apply the
     routed scale the model handed over, exactly once; None leaves the output as is."""
     wrapper = _wrapper()
     wrapper.tp_rank = tp_rank
     wrapper.wrapper = None
     wrapper.routed_output_scale = scale
-    monkeypatch.setattr(KTEPWrapperMethod, "sync", lambda self, x: torch.zeros_like(x))
     gpu_output = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.bfloat16)
     expected = gpu_output.clone() if scale is None else gpu_output * scale
     merged = wrapper._merge_cpu_output(gpu_output.clone(), gpu_output.clone())
