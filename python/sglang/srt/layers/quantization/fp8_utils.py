@@ -878,18 +878,7 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
-    # The FlashInfer MXFP8 ops are registered at import time only under an
-    # import-time `is_blackwell` check. On a mixed-arch host a rank's device is
-    # set *after* this module is imported, so an SM12x rank that lands on
-    # Blackwell never registered those ops; referencing them here would raise
-    # NameError. Treat "ops not registered in this process" as no FlashInfer
-    # MXFP8 and fall through to the block-fp8 fallback. Same-arch hosts always
-    # have the ops registered here, so they are unaffected.
-    if (
-        get_platform().is_blackwell
-        and is_flashinfer_available()
-        and "_raw_flashinfer_mm_mxfp8" in globals()
-    ):
+    if get_platform().is_blackwell and is_flashinfer_available():
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
@@ -909,13 +898,8 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
-    """Resolve the MXFP8 backend (FlashInfer on CUDA, gfx950 on ROCm) for 32-wide-K
-    ue8m0 block-fp8 weights. FlashInfer requires Blackwell; consumer Blackwell (SM120)
-    resolves on auto as well:
-    there the Triton block kernel falls back to its untuned default config
-    (no split-K outside SM90), while the FlashInfer MXFP8 GEMMs are natively
-    instantiated for sm120. Other settings keep the block kernel unchanged.
-    """
+    """The MXFP8 backend (FlashInfer on CUDA, gfx950 on ROCm) a 32-wide-K ue8m0
+    block-fp8 weight can run on."""
     backend = get_fp8_gemm_runner_backend()
     # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 takes an MXFP8 route
     if _is_hip and _is_gfx95_supported:
@@ -924,11 +908,9 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
         if backend.is_aiter():
             return Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
         return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
-    # initialize_fp8_gemm_config() pre-resolves `auto` to the plain `cutlass`
-    # runner on SM120, but only for the 128x128 block path. This MXFP8 route is
-    # resolved separately, so on SM120 that pre-resolution must read as `auto`
-    # here; otherwise server processes (which call initialize) differ from
-    # bare imports and the 32-wide-K ue8m0 weights silently fall back to Triton.
+    # SM120 routes on `auto` too, where Triton's block kernel runs an untuned config.
+    # initialize_fp8_gemm_config() pre-resolves `auto` to `cutlass` there (for the
+    # 128x128 path only), so that value must also read as `auto` here.
     auto_route = backend.is_auto() or (backend.is_cutlass() and get_platform().is_sm120)
     if auto_route:
         if not get_platform().is_sm120:
@@ -958,8 +940,7 @@ def can_serve_block_fp8_as_mxfp8(
 
 
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
-    """The MXFP8 linear for the block-fp8 route, with the FlashInfer autotuner kept out
-    of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
+    """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
     if backend.is_flashinfer_trtllm():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="trtllm", pin_tactic=True
@@ -1917,13 +1898,11 @@ def flashinfer_mxfp8_blockscaled_linear(
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time.
 
-    pin_tactic skips autotuning and uses the backend heuristic to preserve row-wise
-    batch invariance; tactics tuned per M bucket can change the fp32 reduction order.
+    pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
+    reduction order, breaking row-wise batch invariance.
     """
-    # An explicit opt-in: retain the selected backend on other architectures,
-    # shapes, and backends. Measured on RTX PRO 6000 with DSv4.1's dense shapes:
-    # b12x beats cutlass at every M in 1..8, 1.2-12x per shape and 7x over a
-    # layer's six GEMMs (a DSpark draft block runs M=5, its verification M=6).
+    # Measured on RTX PRO 6000 with DSv4.1's dense shapes: b12x beats cutlass at
+    # every M in 1..8 (a DSpark draft block runs M=5, its verification M=6).
     if (
         envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH.get()
         and get_platform().is_sm120

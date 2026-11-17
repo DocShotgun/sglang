@@ -670,12 +670,8 @@ def _mhc_pre_gemm_sqrsum_dispatch():
     marker fails on tirx.Bind), so re-wrap it there with warp specialization
     disabled. Other archs keep the original compiled form.
 
-    Resolution is lock-singleton: this is called per forward, and rebuilding
-    the jit wrapper walks TileLang's kernel cache / JIT compile machinery,
-    which is not thread-safe under concurrent forward threads (segfault spam
-    across all threads). functools.cache is insufficient -- concurrent first
-    calls all miss and resolve in parallel -- so serialize resolution behind
-    a lock and memoize the wrapper globally.
+    Resolved once under a lock, not functools.cache: concurrent first calls would
+    each enter TileLang's JIT cache, which is not thread-safe.
     """
     global _mhc_pre_gemm_dispatch_resolved
     wrapper = _mhc_pre_gemm_dispatch_resolved
