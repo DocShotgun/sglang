@@ -100,7 +100,6 @@ class TestDraftExtendLengths(CustomTestCase):
                 backend._draft_block_extend_lens([6, 6])
 
 
-
 class TestDraftBlockHostLengths(CustomTestCase):
     """A draft batch without host lengths must not read the device lengths back on
     CUDA: the read syncs every step and fails the glue-graph capture."""
@@ -113,6 +112,7 @@ class TestDraftBlockHostLengths(CustomTestCase):
     def test_cpu_tensors_keep_their_values_for_the_reference_path(self):
         lens = dsv4._draft_block_host_seq_lens(torch.tensor([5, 7]), None)
         self.assertEqual(lens, [5, 7])
+
 
 def _runner(*, draft=True, backend=None):
     runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)

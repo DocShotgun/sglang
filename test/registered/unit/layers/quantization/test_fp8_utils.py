@@ -479,7 +479,6 @@ class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
                 self._run(dtype)
 
 
-
 class TestSm120B12xSmallBatchGate(CustomTestCase):
     """SGLANG_SM120_MXFP8_B12X_SMALL_BATCH sends SM120 MXFP8 GEMMs of 1..8 rows to
     b12x, the DSpark draft block's 5 rows included; larger GEMMs keep cutlass."""

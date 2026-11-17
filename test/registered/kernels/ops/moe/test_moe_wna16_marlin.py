@@ -716,9 +716,9 @@ def test_fused_marlin_moe_mxfp4_matches_dequant_reference(tokens, masked):
             120, 124, (experts, rows, cols // 32), device="cuda", dtype=torch.uint8
         ).view(torch.float8_e8m0fnu)
         packed = (codes[..., ::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
-        reference = (
-            levels[codes] * scales.float().repeat_interleave(32, dim=-1)
-        ).to(dtype)
+        reference = (levels[codes] * scales.float().repeat_interleave(32, dim=-1)).to(
+            dtype
+        )
         return packed, scales, reference
 
     w13, s13, ref13 = make_weight(2 * intermediate, hidden)

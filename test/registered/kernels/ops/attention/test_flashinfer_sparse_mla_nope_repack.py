@@ -46,7 +46,9 @@ def _indices(tokens: int, n_rows: int, generator: torch.Generator) -> torch.Tens
     # Variable top-k lengths with -1 padding; the last token selects nothing.
     indices = torch.full((tokens, TOPK), -1, dtype=torch.int32, device="cuda")
     for t in range(tokens - 1):
-        length = int(torch.randint(1, TOPK + 1, (1,), generator=generator, device="cuda"))
+        length = int(
+            torch.randint(1, TOPK + 1, (1,), generator=generator, device="cuda")
+        )
         perm = torch.randperm(n_rows, generator=generator, device="cuda")
         indices[t, :length] = perm[:length].to(torch.int32)
     return indices
@@ -96,7 +98,9 @@ class TestNopePoolRepackMatchesGather(CustomTestCase):
                     / 4
                 ).to(torch.bfloat16)
 
-                pooled, pool_tags = self._forward(q, kv_rows[:n_rows], indices, workspace)
+                pooled, pool_tags = self._forward(
+                    q, kv_rows[:n_rows], indices, workspace
+                )
                 gathered, gather_tags = self._forward(q, kv_rows, indices, workspace)
 
                 self.assertEqual(pool_tags, ["pool"])

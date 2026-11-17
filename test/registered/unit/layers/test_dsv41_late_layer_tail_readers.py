@@ -11,6 +11,8 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
+from sglang.srt.arg_groups import deepseek_v4_hook
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
@@ -19,8 +21,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     late_layer_whole_extend,
 )
 from sglang.srt.model_executor import forward_batch_info
-from sglang.srt.arg_groups import deepseek_v4_hook
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,

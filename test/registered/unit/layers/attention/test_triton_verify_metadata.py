@@ -175,9 +175,7 @@ def test_graph_draft_extend_populates_sliding_window_metadata():
     backend.kv_index_translator = _SlidingKVIndexTranslator()
     backend.token_to_kv_pool = SimpleNamespace()
     backend.cuda_graph_window_kv_indices = torch.zeros(32, dtype=torch.int64)
-    backend.cuda_graph_window_kv_offsets = torch.zeros(
-        batch_size, dtype=torch.int32
-    )
+    backend.cuda_graph_window_kv_offsets = torch.zeros(batch_size, dtype=torch.int32)
 
     spec_info = SimpleNamespace(
         extend_seq_lens_tensor=torch.tensor([3, 3], dtype=torch.int32)
@@ -198,9 +196,7 @@ def test_graph_draft_extend_populates_sliding_window_metadata():
     assert metadata.window_kv_indices is backend.cuda_graph_window_kv_indices
     assert torch.equal(metadata.window_kv_indptr, torch.tensor([0, 4, 8]))
     assert torch.equal(metadata.window_kv_offsets[:batch_size], torch.tensor([1, 3]))
-    assert torch.equal(
-        backend.kv_index_translator.kv_start_idx, torch.tensor([1, 3])
-    )
+    assert torch.equal(backend.kv_index_translator.kv_start_idx, torch.tensor([1, 3]))
 
 
 @pytest.mark.parametrize("with_spec_info", (False, True))

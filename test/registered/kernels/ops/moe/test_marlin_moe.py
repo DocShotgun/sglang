@@ -533,7 +533,9 @@ class TestFusedMarlinMoe(CustomTestCase):
         torch.manual_seed(0)
         local, total, topk, hidden, inter = 6, 32, 8, 512, 256
         dtype = torch.bfloat16
-        w13 = [make_nvfp4_weight_and_ref(2 * inter, hidden, dtype) for _ in range(local)]
+        w13 = [
+            make_nvfp4_weight_and_ref(2 * inter, hidden, dtype) for _ in range(local)
+        ]
         w2 = [make_nvfp4_weight_and_ref(hidden, inter, dtype) for _ in range(local)]
 
         def stacked(parts, field):
