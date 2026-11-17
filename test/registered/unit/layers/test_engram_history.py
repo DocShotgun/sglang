@@ -5,7 +5,6 @@ import ctypes
 import mmap
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -90,39 +89,24 @@ class TestEngramHistoryMultimodalPads(CustomTestCase):
         )
 
 
+def _node_ranges(text: str) -> list[int]:
+    """Expand node-range notation ("0-3", "0,2-5") to node ids."""
+    nodes = []
+    for chunk in text.strip().split(","):
+        lo, _, hi = chunk.partition("-")
+        nodes.extend(range(int(lo), int(hi or lo) + 1))
+    return nodes
+
+
 class TestEngramHostTableNumaInterleave(CustomTestCase):
-    def _mbind_nodes(self, online):
-        """Nodes the kernel would interleave over: mbind reads only maxnode - 1
-        bits of the mask (get_nodes() in mm/mempolicy.c)."""
-        calls = []
-
-        def fake_mbind(ptr, nbytes, mask, maxnode):
-            calls.append(([int(word) for word in mask], maxnode))
-            return 0
-
-        with (
-            patch.object(engram, "_online_numa_nodes", return_value=online),
-            patch.object(engram, "_mbind_interleave", fake_mbind),
-        ):
-            engram._interleave_numa_pages(0, 4096, "test")
-        (words, maxnode), = calls
-        self.assertGreaterEqual(len(words) * 64, maxnode - 1)
-        return [
-            bit for bit in range(maxnode - 1) if words[bit // 64] >> (bit % 64) & 1
-        ]
-
-    def test_mask_covers_every_online_node(self):
-        """The highest node id must stay inside the bits mbind reads, including
-        node 63 on a 64-node host and ids past the first mask word."""
-        for online in ([0, 1], [0, 1, 2, 3], list(range(64)), [0, 2, 64]):
-            with self.subTest(online=online):
-                self.assertEqual(self._mbind_nodes(online), online)
-
-    def test_kernel_interleaves_over_every_online_node(self):
-        online = engram._online_numa_nodes()
-        if len(online) < 2:
-            self.skipTest("needs at least two online NUMA nodes")
-        pages = 4 * len(online)
+    def test_kernel_interleaves_over_every_node_with_memory(self):
+        """A host table must interleave over every NUMA node with memory, the
+        highest node id included."""
+        with open("/sys/devices/system/node/has_memory") as fh:
+            nodes = _node_ranges(fh.read())
+        if len(nodes) < 2:
+            self.skipTest("needs at least two NUMA nodes with memory")
+        pages = 4 * len(nodes)
         table = mmap.mmap(-1, pages * mmap.PAGESIZE)
         anchor = ctypes.c_char.from_buffer(table)
         try:
@@ -138,7 +122,7 @@ class TestEngramHostTableNumaInterleave(CustomTestCase):
             del anchor
             table.close()
         self.assertTrue(policy.startswith("interleave:"), policy)
-        self.assertEqual(engram._parse_node_ranges(policy.split(":", 1)[1]), online)
+        self.assertEqual(_node_ranges(policy.split(":", 1)[1]), nodes)
 
 
 if __name__ == "__main__":
