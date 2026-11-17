@@ -416,7 +416,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and 0 < self.num_gpu_experts < num_experts
         ):
             if self.kt_config.num_layers is None:
-                raise ValueError("--kt-expert-profile needs num_hidden_layers in the config")
+                raise ValueError(
+                    "--kt-expert-profile needs num_hidden_layers in the config"
+                )
             self.gpu_expert_slots = _layer_gpu_slots(
                 self.kt_config.expert_profile,
                 self.kt_config.layer_idx,
@@ -642,7 +644,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         log2phy = self._logical_to_physical(x.device)
         if log2phy is not None:
             ids = topk_output.topk_ids
-            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(ids.dtype)
+            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(
+                ids.dtype
+            )
             topk_output = topk_output._replace(topk_ids=remapped)
             dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
@@ -823,7 +827,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         table = None
         # Other routers already remapped; a second remap would misroute.
         if meta is not None and self.kt_config.router_emits_logical_ids:
-            m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(device)
+            m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(
+                device
+            )
             if not torch.equal(m.cpu(), torch.arange(m.numel(), dtype=m.dtype)):
                 table = m.to(torch.int64)
         self.__dict__["_log2phy_cache"] = table

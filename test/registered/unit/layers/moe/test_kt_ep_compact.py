@@ -73,7 +73,9 @@ def test_compact_skips_padding_and_cpu_routes():
     assert tok_idx.tolist() == [1, 2]
     # The GPU method must see unit weights: the real weight is applied once,
     # in the scatter, regardless of the method's combine semantics.
-    assert torch.equal(wrapper.gpu_method.topk_weights, torch.ones_like(topk_weights[:2]))
+    assert torch.equal(
+        wrapper.gpu_method.topk_weights, torch.ones_like(topk_weights[:2])
+    )
     torch.testing.assert_close(rows, dispatch.hidden_states[tok_idx] * 2.0)
     torch.testing.assert_close(route_weights, topk_weights[1:3])
 
@@ -305,7 +307,9 @@ def test_apply_dummy_rows_send_slots_and_zero_cpu_routes():
 def test_apply_compact_rows_send_slots():
     wrapper = _gpu_only_wrapper(torch.tensor([-1, 0, -1, 1], dtype=torch.int32))
     # 16 tokens take the compact path; only experts 1 and 3 are GPU routes.
-    topk_ids = torch.tensor([[e % 4, (e + 1) % 4] for e in range(16)], dtype=torch.int32)
+    topk_ids = torch.tensor(
+        [[e % 4, (e + 1) % 4] for e in range(16)], dtype=torch.int32
+    )
     topk_weights = torch.full(topk_ids.shape, 0.5)
 
     wrapper.apply(None, _dispatch(topk_ids, topk_weights)[0])
