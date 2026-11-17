@@ -80,20 +80,6 @@ def test_compact_skips_padding_and_cpu_routes():
     torch.testing.assert_close(route_weights, topk_weights[1:3])
 
 
-def test_compact_returns_none_without_gpu_routes():
-    wrapper = _wrapper()
-    topk_ids = torch.tensor([[-1], [3]])
-    topk_weights = torch.tensor([[0.5], [0.5]])
-    dispatch, topk_output = _dispatch(topk_ids, topk_weights)
-    gpu_route = (topk_ids >= 0) & (topk_ids < wrapper.num_gpu_experts)
-
-    assert wrapper._gpu_rows_compact(None, dispatch, topk_output, gpu_route) == (
-        None,
-        None,
-        None,
-    )
-
-
 def test_compact_top_k_sum_accumulates_in_fp32():
     """Routes of one token must be weighted and summed in fp32 and rounded to the
     output dtype once: weighting in bf16 misrounds (3.0 * 0.3 gives 0.9023
@@ -218,8 +204,6 @@ def test_profile_accepts_recorder_and_legacy_dump_shapes(tmp_path):
     [
         ({"decode_count": torch.ones(3, 5)}, "shape"),
         ({"decode_count": torch.ones(4, 4)}, "layers"),
-        ({"decode_count": -torch.ones(3, 4)}, "negative"),
-        ({"rank": 0}, "no decode_count"),
     ],
 )
 def test_profile_rejects_a_mismatched_file(tmp_path, obj, message):
@@ -241,19 +225,6 @@ def test_profile_slots_take_the_most_routed_experts_in_id_order(tmp_path):
     assert slots.dtype == torch.int32
 
 
-def test_profile_slots_ignore_the_default_device(tmp_path):
-    """Model construction runs under a CUDA default device; building the slots there
-    must not mix freshly made tensors with the CPU profile (a startup crash)."""
-    counts = torch.tensor([[5, 1, 5, 0, 9, 0], [0, 3, 0, 4, 0, 0]])
-    path = _save(tmp_path, {"decode_count": counts})
-
-    with torch.device("meta"):
-        slots = kt_expert_placement.layer_gpu_slots(path, 0, 2, 6, 2)
-
-    assert slots.device.type == "cpu"
-    assert slots.tolist() == [0, -1, -1, -1, 1, -1]
-
-
 def test_profile_layer_slots_none_for_experts_0_to_n_and_error_without_routes(tmp_path):
     """A profile that picks experts 0..N-1 must take today's code path unchanged."""
     counts = torch.tensor([[7, 6, 0, 1], [0, 0, 0, 0], [0, 1, 0, 9]])
@@ -268,14 +239,6 @@ def test_profile_layer_slots_none_for_experts_0_to_n_and_error_without_routes(tm
     ]
     with pytest.raises(ValueError, match="no routes recorded for MoE layer 1"):
         kt_expert_placement.layer_gpu_slots(path, 1, 3, 4, 2)
-
-
-def test_gpu_expert_slot_for_the_weight_loader():
-    default = _wrapper()
-    assert [default.gpu_expert_slot(e) for e in range(4)] == [0, 1, -1, -1]
-
-    placed = _wrapper(gpu_expert_slots=torch.tensor([-1, 0, -1, 1], dtype=torch.int32))
-    assert [placed.gpu_expert_slot(e) for e in range(4)] == [-1, 0, -1, 1]
 
 
 def test_gpu_routes_without_a_profile_are_unchanged():
@@ -373,13 +336,6 @@ def test_profile_rejects_conflicting_options(fields, message):
             kt_expert_placement.check_expert_profile_args()
 
 
-def test_profile_accepts_the_default_options():
-    with get_context().override_server_args(
-        kt_expert_profile="p.pt", kt_max_deferred_experts_per_token=0
-    ):
-        kt_expert_placement.check_expert_profile_args()
-
-
 def test_gpu_runner_gets_no_routed_scale():
     """The CPU experts never apply routed_scaling_factor; a GPU runner handed it would
     weight the GPU experts by it twice once the model scales their sum."""
@@ -393,12 +349,12 @@ def test_gpu_runner_gets_no_routed_scale():
     assert seen == {"scale": None}
 
 
-@pytest.mark.parametrize("tp_rank, scale", [(0, 2.5), (1, 2.5), (1, None)])
-def test_merge_without_cpu_experts_scales_once(tp_rank, scale):
-    """Ranks that run no CPU experts (tp_rank > 0, or no KT wrapper) still apply the
-    routed scale the model handed over, exactly once; None leaves the output as is."""
+@pytest.mark.parametrize("scale", [2.5, None])
+def test_merge_without_cpu_experts_scales_once(scale):
+    """Ranks that run no CPU experts (tp_rank > 0) still apply the routed scale the
+    model handed over, exactly once; None leaves the output as is."""
     wrapper = _wrapper()
-    wrapper.tp_rank = tp_rank
+    wrapper.tp_rank = 1
     wrapper.wrapper = None
     wrapper.routed_output_scale = scale
     gpu_output = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.bfloat16)

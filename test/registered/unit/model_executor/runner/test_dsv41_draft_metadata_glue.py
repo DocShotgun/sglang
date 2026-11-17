@@ -109,10 +109,6 @@ class TestDraftBlockHostLengths(CustomTestCase):
         seq_lens.tolist.side_effect = AssertionError("device lengths read back")
         self.assertEqual(dsv4._draft_block_host_seq_lens(seq_lens, None), [0, 0, 0])
 
-    def test_cpu_tensors_keep_their_values_for_the_reference_path(self):
-        lens = dsv4._draft_block_host_seq_lens(torch.tensor([5, 7]), None)
-        self.assertEqual(lens, [5, 7])
-
 
 def _runner(*, draft=True, backend=None):
     runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)

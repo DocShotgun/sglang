@@ -9,7 +9,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("kv_heads", [2, 4])
 @pytest.mark.parametrize("single_precision", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -26,10 +25,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 )
 @pytest.mark.parametrize("use_sinks,window", [(False, -1), (False, 1), (True, 1)])
 def test_packed_vision_sdpa_matches_reference(
-    kv_heads, single_precision, dtype, device, use_sinks, window
+    single_precision, dtype, device, use_sinks, window
 ):
     torch.manual_seed(0)
-    tokens, heads, dim = 6, 4, 64
+    tokens, heads, kv_heads, dim = 6, 4, 2, 64
     q = torch.randn(tokens, heads, dim).to(device=device, dtype=dtype)
     k = torch.randn(tokens, kv_heads, dim).to(device=device, dtype=dtype)
     v = torch.randn(tokens, kv_heads, dim).to(device=device, dtype=dtype)

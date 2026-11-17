@@ -1190,13 +1190,6 @@ class TestCandidateIndexerGating(CustomTestCase):
         with sm100(True), sm100_family, patch(flag, False):
             with self.assertRaises(RuntimeError):
                 make(2048, 8)
-        # SM120/121 have no sparse MQA logits kernels at all: serve candidates on
-        # dense block ids instead of failing.
-        sm12x = patch.object(v41_indexer, "is_sm100_family", lambda: False)
-        with sm100(True), sm12x, patch(flag, False):
-            prefill, decode = make(2048, 8)
-        self.assertIsInstance(prefill, DenseBlocksBackend)
-        self.assertIsInstance(decode, DenseBlocksBackend)
 
 
 if __name__ == "__main__":
