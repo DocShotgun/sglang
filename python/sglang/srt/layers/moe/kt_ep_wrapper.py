@@ -96,15 +96,13 @@ def create_kt_config_from_server_args(
     if get_flags().moe.in_speculative_scope:
         return None
 
-    num_layers = getattr(
-        model_config_of(server_args).hf_config, "num_hidden_layers", None
-    )
+    # Multimodal checkpoints (Kimi K2.6) keep the text model's settings in text_config.
+    text_config = model_config_of(server_args).hf_text_config
+    num_layers = getattr(text_config, "num_hidden_layers", None)
     # GLM-5-Next clamps gate/up inside SwiGLU on the GPU path (see
     # models/glm5_next.py swiglu_clamped); kt must clamp identically or CPU
     # and GPU experts diverge.
-    swiglu_limit = float(
-        getattr(model_config_of(server_args).hf_config, "swiglu_limit", 0.0) or 0.0
-    )
+    swiglu_limit = float(getattr(text_config, "swiglu_limit", 0.0) or 0.0)
     expert_profile = get_exec().moe.kt_expert_profile
     if expert_profile is not None:
         check_expert_profile_args()
