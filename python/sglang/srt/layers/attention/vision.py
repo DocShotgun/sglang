@@ -16,6 +16,11 @@ from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.vision_sinks import (
+    check_sink_backend,
+    fa4_pack_gqa,
+    fold_attention_sinks,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
     get_context,
@@ -670,6 +675,7 @@ class VisionFlash4Attention(nn.Module):
                 cu_seqlens_gpu, kwargs.get("max_seqlen")
             )
 
+        s_aux = kwargs.get("s_aux")
         output = flash_attn_func(
             q,
             k,
@@ -679,8 +685,15 @@ class VisionFlash4Attention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            window_size=kwargs.get("window_size", (-1, -1)),
+            pack_gqa=fa4_pack_gqa(q.shape[-1], q.shape[-2], k.shape[-2]),
+            return_softmax_lse=s_aux is not None,
             ver=4,
         )
+        # The SM80/SM120 FA4 kernels reject learnable sinks; fold them in from the LSE.
+        if s_aux is not None:
+            output, lse = output
+            fold_attention_sinks(output, lse, s_aux)
 
         return output
 
@@ -1209,6 +1222,7 @@ class VisionAttention(nn.Module):
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
         self.qkv_backend_name: str = qkv_backend
+        check_sink_backend(qkv_backend, use_sink)
 
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
