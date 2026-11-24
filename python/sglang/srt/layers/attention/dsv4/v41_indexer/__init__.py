@@ -121,7 +121,16 @@ def make_candidate_indexer(
                 "DeepGEMM paged sparse MQA logits unavailable on this GPU; "
                 "DSv4.1 candidate layers use dense block ids"
             )
-            return dense_blocks, dense_blocks
+            from .dense_blocks_sm120 import Sm120DenseBlocksBackend
+
+            sm120_decode = Sm120DenseBlocksBackend(
+                token_to_kv_pool=token_to_kv_pool,
+                req_to_token=req_to_token,
+                candidate_topk_blocks=candidate_topk_blocks,
+                candidate_block_size=candidate_block_size,
+                use_deep_gemm_prefill=use_deep_gemm_prefill,
+            )
+            return dense_blocks, sm120_decode
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
