@@ -565,6 +565,7 @@ class AudioEncoderAttention(nn.Module):
             proj_bias=True,
             flatten_batch=True,
             window_size=window_size,
+            causal=causal,
             customized_position_embedding_applier=_audio_rope_applier,
             prefix="attn",
             # TODO: the audio encoder does not follow --mm-enable-dp-encoder and
@@ -587,6 +588,7 @@ class AudioEncoderAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_position_embeddings,
             max_seqlen=max_seqlen,
+            full_attn=False,
         )
         return out.squeeze(0)
 

@@ -416,6 +416,8 @@ class VisionSdpaAttention(nn.Module):
             attention_mask = attention_mask.to(device=q.device)
 
         window_left, window_right = kwargs.get("window_size", (-1, -1))
+        if kwargs.get("causal", False):
+            window_right = 0
         if window_left >= 0 or window_right >= 0:
             positions = torch.arange(s, device=q.device)
             distance = positions[None, :] - positions[:, None]
@@ -685,6 +687,7 @@ class VisionFlash4Attention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            causal=kwargs.get("causal", False),
             window_size=kwargs.get("window_size", (-1, -1)),
             pack_gqa=fa4_pack_gqa(q.shape[-1], q.shape[-2], k.shape[-2]),
             return_softmax_lse=s_aux is not None,
@@ -1169,6 +1172,7 @@ class VisionAttention(nn.Module):
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
+        causal: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -1299,6 +1303,7 @@ class VisionAttention(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
         self.window_size = window_size
+        self.causal = causal
         if use_sink:
             # Allocate the full (unsharded) sink tensor for weight loading;
             # only the local TP slice is used in forward.
@@ -1590,14 +1595,14 @@ class VisionAttention(nn.Module):
             else:
                 q, k = self._apply_qk_norm(q, k)
 
-        if full_attn or self.sinks is None:
+        if full_attn:
             effective_window_size = (-1, -1)
             s_aux = None
         else:
             effective_window_size = self.window_size
             q_head_start = self.tp_rank * self.num_attention_heads_per_partition
             q_head_end = (self.tp_rank + 1) * self.num_attention_heads_per_partition
-            s_aux = self.sinks[q_head_start:q_head_end]
+            s_aux = None if self.sinks is None else self.sinks[q_head_start:q_head_end]
 
         output = self.qkv_backend.forward(
             q=q,
@@ -1613,6 +1618,7 @@ class VisionAttention(nn.Module):
             output_ws=attn_output_ws,
             softmax_scale=self.softmax_scale,
             window_size=effective_window_size,
+            causal=self.causal,
             s_aux=s_aux,
         )
 
