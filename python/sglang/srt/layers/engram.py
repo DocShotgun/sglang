@@ -6,6 +6,7 @@ sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 
 from __future__ import annotations
 
+import concurrent.futures
 import ctypes
 import errno
 import functools
@@ -730,6 +731,35 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+# Threads that fault in and fill the ~100 GB host tables; model loading runs torch on one
+# thread. Arbitrary.
+_HOST_TABLE_THREADS = 32
+
+
+def _prefault(mm: mmap.mmap, nbytes: int) -> None:
+    """Fault in every page of a new table with parallel writes. cudaHostRegister faults them
+    on one thread: 10.3 s against 1.4 s here for 48 GiB [measured]."""
+    pages = np.frombuffer(mm, dtype=np.uint8)
+    step = max(1, nbytes // _HOST_TABLE_THREADS // mmap.PAGESIZE) * mmap.PAGESIZE
+
+    def touch(start: int) -> None:
+        pages[start : start + step : mmap.PAGESIZE] = 0
+
+    with concurrent.futures.ThreadPoolExecutor(_HOST_TABLE_THREADS) as pool:
+        list(pool.map(touch, range(0, nbytes, step)))
+
+
+def _parallel_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """dst.copy_(src), split over threads along dim 0."""
+    chunk = max(1, -(-dst.shape[0] // _HOST_TABLE_THREADS))
+
+    def copy(start: int) -> None:
+        dst[start : start + chunk].copy_(src[start : start + chunk])
+
+    with concurrent.futures.ThreadPoolExecutor(_HOST_TABLE_THREADS) as pool:
+        list(pool.map(copy, range(0, dst.shape[0], chunk)))
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -772,8 +802,10 @@ class _HostTable:
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
-            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            _prefault(self.mm, nbytes)
         if layout == "shared":
+            if group.rank_in_group == 0:
+                _prefault(self.mm, nbytes)
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
@@ -1132,9 +1164,9 @@ class EngramEmbedding(nn.Module):
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
+            _parallel_copy(param.data[rows], loaded_weight[rows])
         else:
-            param.data.copy_(loaded_weight[rows])
+            _parallel_copy(param.data, loaded_weight[rows])
         if self.host_table is not None:
             self.host_table.dirty = True
 
