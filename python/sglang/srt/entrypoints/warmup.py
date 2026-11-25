@@ -8,6 +8,7 @@ import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -159,3 +160,23 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("full_prefill_chunk")
+async def full_prefill_chunk(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """One prompt of a full prefill chunk, so the graphs and workspaces that wait for
+    the first full chunk (DSv4.1's decoder tail graphs) are set up before the first
+    request."""
+    chunk = get_schedule().chunked_prefill_size
+    # RowBucketGraphRunner.ready's threshold: the chunk size, else 8192.
+    size = chunk if chunk and chunk > 0 else 8192
+    generate_req_input = GenerateReqInput(
+        input_ids=np.random.randint(2**16, size=[size]).tolist(),
+        sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+    )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+    await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
