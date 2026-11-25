@@ -19,6 +19,8 @@ from sglang.srt.layers.moe.kt_expert_placement import (
     check_expert_profile_args,
     count_routes,
     layer_gpu_slots,
+    register_kt_layer,
+    wait_kt_cpu_load,
     warn_profile_unused,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -294,6 +296,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     else None
                 ),
             )
+            register_kt_layer(layer_idx=self.kt_config.layer_idx, method=self)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -317,18 +320,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
             torch.cuda.synchronize()
-
-            # Get expert location metadata for CPU expert mapping
-            from sglang.srt.eplb.expert_location_dispatch import (
-                get_global_expert_location_metadata,
+            wait_kt_cpu_load(
+                layer_idx=self.kt_config.layer_idx, load=self.load_cpu_experts
             )
 
-            physical_to_logical_map_cpu = (
-                get_global_expert_location_metadata()
-                .physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                .contiguous()
-            )
-            self.wrapper.load_weights(physical_to_logical_map_cpu)
+    def load_cpu_experts(self) -> None:
+        """Load this layer's CPU experts into kt-kernel; start_kt_cpu_loads runs it on
+        its background thread."""
+        # Get expert location metadata for CPU expert mapping
+        from sglang.srt.eplb.expert_location_dispatch import (
+            get_global_expert_location_metadata,
+        )
+
+        physical_to_logical_map_cpu = (
+            get_global_expert_location_metadata()
+            .physical_to_logical_map_cpu[self.kt_config.layer_idx]
+            .contiguous()
+        )
+        self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"

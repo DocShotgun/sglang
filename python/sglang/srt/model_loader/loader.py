@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -88,6 +89,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.moe.kt_expert_placement import kt_layers_registered
 from sglang.srt.layers.moe.utils import (
     resolve_shared_experts_config,
 )
@@ -96,6 +98,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.model_loader.kt_direct_read import kt_direct_read_weights_iterator
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -419,6 +422,10 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        tensor_filter: Optional[Callable[[str], bool]] = None
+        """The checkpoint tensor names load_weights uses, if known. The KT direct-read
+        iterator skips the others without reading them."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -430,6 +437,7 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                tensor_filter=getattr(model, "checkpoint_tensor_filter", None),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -688,7 +696,16 @@ class DefaultModelLoader(BaseModelLoader):
                 )
                 use_multithread = False
 
-            if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+            if (
+                kt_layers_registered()
+                and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
+                and not weight_loader_disable_mmap
+                and not concurrent_prefetch_active
+            ):
+                weights_iterator = kt_direct_read_weights_iterator(
+                    hf_weights_files, keep=source.tensor_filter
+                )
+            elif self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,

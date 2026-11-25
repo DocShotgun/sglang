@@ -1117,6 +1117,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
+    def checkpoint_tensor_filter(self, name: str) -> bool:
+        """Whether load_weights uses this tensor of the target checkpoint, which holds
+        the DSpark head."""
+        if _is_npu:
+            return self._remap_dspark_weight_name_npu(name) is not None
+        return self._remap_dspark_weight_name(name) is not None
+
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None

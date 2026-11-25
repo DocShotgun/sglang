@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KT expert placement: --kt-expert-profile's per-layer GPU experts, and the
-KT_ROUTING_DUMP histogram that records such profiles."""
+"""KT expert placement: --kt-expert-profile's per-layer GPU experts, the
+KT_ROUTING_DUMP histogram that records such profiles, and which checkpoint tensors
+kt-kernel loads for the CPU."""
 
+import concurrent.futures
 import functools
 import logging
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -20,6 +23,81 @@ ROUTING_DUMP_PREFIX = os.environ.get("KT_ROUTING_DUMP")
 # Extra histogram rows past num_hidden_layers for MTP / NextN layers; arbitrary.
 _ROUTING_DUMP_EXTRA_LAYERS = 8
 _routing_state = {}
+
+# Layers whose CPU experts kt-kernel loads, by layer index: [KTEPWrapperMethod, its CPU
+# logical experts once computed].
+_kt_layers = {}
+# Background CPU-expert loads by layer index, from start_kt_cpu_loads.
+_cpu_loads = {}
+_cpu_loads_started = False
+# "...layers.<layer>.[mlp.|ffn.|block_sparse_moe.]experts.<expert>.", as kt-kernel's
+# naming variants spell routed-expert tensors.
+_ROUTED_EXPERT_TENSOR = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.(?:mlp\.|ffn\.|block_sparse_moe\.)?experts\.(\d+)\."
+)
+
+
+def register_kt_layer(layer_idx: int, method) -> None:
+    """Record a layer whose CPU experts kt-kernel loads (method: its KTEPWrapperMethod)."""
+    _kt_layers[layer_idx] = [method, None]
+
+
+def kt_layers_registered() -> bool:
+    return bool(_kt_layers)
+
+
+def is_kt_cpu_expert_tensor(name: str) -> bool:
+    """Whether a checkpoint tensor belongs to a routed expert that kt-kernel loads for the
+    CPU, which the GPU weight loader skips."""
+    match = _ROUTED_EXPERT_TENSOR.search(name)
+    entry = _kt_layers.get(int(match.group(1))) if match else None
+    if entry is None:
+        return False
+    if entry[1] is None:
+        entry[1] = _cpu_logical_experts(layer_idx=int(match.group(1)), method=entry[0])
+    return int(match.group(2)) in entry[1]
+
+
+def start_kt_cpu_loads() -> None:
+    """Load every registered layer's CPU experts on one background thread, in layer
+    order, so they overlap the GPU weights' load. Once per process."""
+    global _cpu_loads_started
+    if _cpu_loads_started or not _kt_layers:
+        return
+    _cpu_loads_started = True
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="kt_cpu_load"
+    )
+    for layer_idx in sorted(_kt_layers):
+        _cpu_loads[layer_idx] = pool.submit(_kt_layers[layer_idx][0].load_cpu_experts)
+    pool.shutdown(wait=False)
+
+
+def wait_kt_cpu_load(layer_idx: int, load) -> None:
+    """Wait for this layer's background load, or call load() if none was started."""
+    future = _cpu_loads.pop(layer_idx, None)
+    if future is None:
+        load()
+    else:
+        future.result()
+
+
+def _cpu_logical_experts(layer_idx: int, method) -> frozenset:
+    """Logical experts with no GPU replica, as kt-kernel's load_weights selects them."""
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    metadata = get_global_expert_location_metadata()
+    num_physical = method.global_num_experts
+    if metadata is None:
+        physical_to_logical = list(range(num_physical))
+    else:
+        physical_to_logical = metadata.physical_to_logical_map_cpu[layer_idx].tolist()
+    on_gpu = {
+        physical_to_logical[p]
+        for p in range(num_physical)
+        if method.gpu_expert_slot(p) >= 0
+    }
+    return frozenset(set(physical_to_logical) - on_gpu)
 
 
 def check_expert_profile_args() -> None:
